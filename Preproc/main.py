@@ -18,7 +18,7 @@ file_name = "/mnt/raid/datasets/WIT/wit_v1.train.all-00000-of-00010.tsv"
 img_dir = "/mnt/raid/datasets/WIT/img/0/"
 #Load data into chunks so that we can just fetch the URL
 for c in pd.read_csv(file_name, sep='\t', chunksize = 10**6):
-    english_only = c.loc[df['language'] == 'en']
+    english_only = c.loc[c['language'] == 'en']
     urls = english_only["image_url"]
     if data is None:
         data = urls
