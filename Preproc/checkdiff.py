@@ -23,6 +23,9 @@ img_dir = "/mnt/raid/datasets/WIT/img/0/"
 for c in tqdm(pd.read_csv(file_name, sep='\t', chunksize = 10**5)):
     #Store which chunks to drop
     to_drop = list()
+    #English only. We wont be using this in the long run
+    c = c.loc[c['language'] == 'en']
+
     for row in c.iterrows():
         idx = row[0]
         url = row[1]['image_url']
