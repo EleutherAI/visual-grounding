@@ -11,7 +11,6 @@ from multiprocessing.pool import ThreadPool
 from multiprocessing import Pool
 
 
-chunks = 0
 data = None
 #To be done as an argument later
 file_name = "/mnt/raid/datasets/WIT/wit_v1.train.all-00000-of-00010.tsv"
@@ -24,9 +23,6 @@ for c in pd.read_csv(file_name, sep='\t', chunksize = 10**6):
         data = urls
     else:
         data = data.add(urls, fill_value="")
-    chunks += 1
-    if chunks == 2:
-        break
 data = list(data)
 def url_download(url):
     #Check if file was already downloaded
