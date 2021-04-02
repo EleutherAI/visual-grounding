@@ -36,7 +36,7 @@ def url_download(url):
     except:
         pass
 
-with ThreadPool(processes=8) as p:
+with ThreadPool(processes=16) as p:
     with tqdm(total=len(data)) as pbar:
         for i, _ in enumerate(p.imap_unordered(url_download, data)):
             pbar.update()
