@@ -17,8 +17,6 @@ tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-1.3B")
 neo_hidden = model.config.hidden_size
 clip_hidden = 512
 projection = torch.nn.Linear(neo_hidden, clip_hidden).to(device)
-for param in projection.parameters():
-    param.requires_grad = False
 
 
 #hparams
