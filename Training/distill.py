@@ -138,7 +138,7 @@ data = DistillDataset(tokenizer = tokenizer, clip_batch_size = 8,\
 model.resize_token_embeddings(len(data.tokenizer))
 
 #Set up optimizer
-opt = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+opt = AdamW([model.parameters(), projection.parameters()], lr=learning_rate, weight_decay=weight_decay)
 
 for batch, data_elem in enumerate(data):
     model_input = {
