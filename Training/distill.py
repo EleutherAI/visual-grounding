@@ -1,14 +1,32 @@
 from transformers import GPTNeoModel, GPTNeoForCausalLM,\
-    GPT2Tokenizer, GPTNeoConfig
+    GPT2Tokenizer, GPTNeoConfig, AdamW
 from torch.utils.data import IterableDataset, DataLoader 
 from lm_dataformat import *
 import torch
+from torch.nn.functional import normalize, cross_entropy
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 #initalize a smol boi
 config = GPTNeoConfig(hidden_size = 128, num_layers = 24, attention_layers = 24)
 #create model
-model = GPTNeoForCausalLM(config)
+model = GPTNeoForCausalLM(config).to(device)
 tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-1.3B")
+
+#Initialize a random projection matrix
+neo_hidden = model.config.hidden_size
+clip_hidden = 512
+projection = torch.nn.Linear(neo_hidden, clip_hidden).to(device)
+for param in projection.parameters():
+    param.requires_grad = False
+
+
+#hparams
+temperature = 1.0
+learning_rate = 5e-5
+weight_decay = 0
+grad_accum = 2
+
+temp_tensor = torch.tensor(temperature).to(device)
 
 #pytorch dataset for clip juicing
 class DistillDataset(IterableDataset):
@@ -51,7 +69,7 @@ class DistillDataset(IterableDataset):
             text, _ =next(self.pile_rdr)
             txts.append(text)
             #Place holder
-            img_latents.append([[0]*512])
+            img_latents.append([[0]*clip_hidden])
         #Return an element from CLIP
         else:
             txts = list()
@@ -63,29 +81,76 @@ class DistillDataset(IterableDataset):
                 img_latents.append([img_latent])
 
         #Tokenize text
-        print(txts)
-        toks = tok.batch_encode_plus(txts, max_length=2048, truncation=True, padding=True, return_tensors="pt")
+        toks = tok.batch_encode_plus(txts, max_length=2048, truncation=True, padding=True, return_tensors="pt").to(device)
         #Get the index of the clip tokens.
-        clip_idx = torch.sum(toks.attention_mask, dim=-1) - torch.tensor([1] * len(txts))
+        clip_idx = torch.sum(toks.attention_mask, dim=-1) - torch.tensor([1] * len(txts)).to(device)
         #Get latent vectors
-        latents = torch.stack([torch.tensor(x) for x in img_latents])
+        latents = torch.stack([torch.tensor(x) for x in img_latents]).to(device)
 
         cc = self.cur_clip
         #Flip cur clip
         self.cur_clip = not self.cur_clip 
         return {
-            'toks' : toks,
+            **toks,
             'latent_vecs' : latents,
             'clip_idx' : clip_idx, 
             'use_distill' : cc,
         }
 
+#Contrastive loss helper function
+def clip_loss(a, b, temp):
+    # a ~ (b x d)
+    # b ~ (b x d)
+    batch_size, dimension = a.shape
 
+    a_normd = normalize(a, p=2, dim=1).squeeze()
+    b_normd = normalize(b, p=2, dim=1).squeeze()
+    logits = torch.einsum('i d, j d -> i j', a_normd, b_normd) * temp.exp()
 
+    labels = torch.arange(batch_size).to(device)
+
+    loss = cross_entropy(logits, labels) + cross_entropy(logits.T, labels)
     
-data = DistillDataset(tokenizer = tokenizer, clip_batch_size = 128,\
+    return loss / 2.0
+
+#Load dataset
+data = DistillDataset(tokenizer = tokenizer, clip_batch_size = 8,\
     clip_dataset_dir = "../clip_latents_100k.jsonl.zst",\
     pile_dataset_dir = "../val.jsonl.zst")
-for elem in data:
-    print(elem)
+#resize token embeddings
+model.resize_token_embeddings(len(data.tokenizer))
+
+#Set up optimizer
+opt = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+for batch, data_elem in enumerate(data):
+    model_input = {
+        'input_ids':data_elem['input_ids'],
+        'attention_mask':data_elem['attention_mask'],
+    }
+    #Used for CLIP. TODO: Fetch AR loss (Leo pls do this)
+    out_embeds = model(**model_input, return_dict=True, output_hidden_states=True)['hidden_states']
+    #If we are currently using contrastive loss
+    if data_elem['use_distill']:
+        #out_embeds ~ (b x seq_len x hidden_size)
+        idx = data_elem['clip_idx']
+        last_layer = out_embeds[0]
+        #Get predicted clip embedding. Grab from sequence_len dimension
+        clip_embeds = torch.zeros((data.clip_batch_size, neo_hidden)).to(device)
+        for i,j in enumerate(idx):
+            clip_embeds[i] = last_layer[i][j]
+        #Project to the correct size
+        clip_embeds = projection(clip_embeds)
+        #Compute loss
+        loss = clip_loss(clip_embeds,  data_elem['latent_vecs'], temp_tensor)
+        #loss += ar_loss_with_clip_masked #Leo pls
+    else:
+        pass
+        #Do AR loss only
+    loss.backward()
+    if (batch+1)%grad_accum==0:
+        opt.step()
+        opt.zero_grad()
+    #Validation loop?
+
     break
