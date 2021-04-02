@@ -19,8 +19,6 @@ tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-1.3B")
 neo_hidden = model.config.hidden_size
 clip_hidden = 512
 projection = torch.nn.Linear(neo_hidden, clip_hidden).to(device)
-for param in projection.parameters():
-    param.requires_grad = False
 
 
 #hparams
@@ -144,7 +142,7 @@ data = DistillDataset(tokenizer = tokenizer, clip_batch_size = clip_bs,\
 model.resize_token_embeddings(len(data.tokenizer))
 
 #Set up optimizer
-opt = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+opt = AdamW([model.parameters(), projection.parameters()], lr=learning_rate, weight_decay=weight_decay)
 
 for batch, data_elem in tqdm(enumerate(data)):
     model_input = {
