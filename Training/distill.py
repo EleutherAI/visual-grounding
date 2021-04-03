@@ -15,8 +15,8 @@ config = GPTNeoConfig(hidden_size = 128, num_layers = 24, attention_layers = 24)
 #create model
 model = GPTNeoForCausalLM(config)
 if torch.cuda.device_count() > 1:
-    model = DataParallel(model)
-model.to(device)
+    model_dp = DataParallel(model)
+model_dp.to(device)
 tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-1.3B")
 
 #Initialize a random projection matrix
@@ -148,7 +148,7 @@ loader = DataLoader(dataset=data, batch_size=1)
 model.resize_token_embeddings(len(data.tokenizer))
 
 #Set up optimizer
-opt = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+opt = AdamW(model_dp.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
 #Set up progress bar
 pbar = tqdm(enumerate(loader), total=len(data))
@@ -165,7 +165,7 @@ for batch, data_elem in pbar:
         'attention_mask':data_elem['attention_mask'],
     }
     #Used for CLIP. TODO: Fetch AR loss (Leo pls do this)
-    out_embeds = model(**model_input, return_dict=True, output_hidden_states=True)['hidden_states']
+    out_embeds = model_dp(**model_input, return_dict=True, output_hidden_states=True)['hidden_states']
     
     # debug shapes
     #print([(k, v.shape if isinstance(v, torch.Tensor) else v) for k, v in data_elem.items()])
@@ -187,7 +187,7 @@ for batch, data_elem in pbar:
 
     #compute AR loss
     n_text_toks = data_elem['clip_idx'].sum()
-    loss += ar_loss(model, data_elem['input_ids'], data_elem['attention_mask']) / n_text_toks
+    loss += ar_loss(model_dp, data_elem['input_ids'], data_elem['attention_mask']) / n_text_toks
 
     loss.backward()
     #loss_progress += loss.detatch().cpu().item()
