@@ -184,8 +184,6 @@ for batch, data_elem in pbar:
         #Project to the correct size
         clip_embeds = projection(clip_embeds)
         #Compute contrastive loss
-        print(clip_embeds.size())
-        print(data_elem['latent_vecs'].size())
         loss = lambda_coeff * clip_loss(clip_embeds,  data_elem['latent_vecs'], temp_tensor)
 
     #compute AR loss
