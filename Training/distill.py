@@ -63,7 +63,7 @@ class DistillDataset(IterableDataset):
         self.tokenizer.add_tokens([special_token])
         self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     def __len__(self):
-        return self.steps
+        return int(self.steps)
     def __iter__(self):
         return self
     def __next__(self):
@@ -90,7 +90,7 @@ class DistillDataset(IterableDataset):
         #Tokenize text
         toks = tok.batch_encode_plus(txts, max_length=2048, truncation=True, padding=True, return_tensors="pt").to(device)
         #Get the index of the clip tokens.
-        clip_idx = torch.sum(toks.attention_mask, dim=-1) - torch.tensor([1] * len(txts)).to(device)
+        clip_idx = (torch.sum(toks.attention_mask, dim=-1).to("cpu") - torch.tensor([1] * len(txts)))
         #Get latent vectors
         latents = torch.cat([torch.tensor(x) for x in img_latents], dim=0).to(device)
 
@@ -142,15 +142,24 @@ def ar_loss(model, inp, attn_mask):
 data = DistillDataset(tokenizer = tokenizer, clip_batch_size = clip_bs,\
     clip_dataset_dir = "../clip_latents_100k.jsonl.zst",\
     pile_dataset_dir = "../val.jsonl.zst")
-loader = DataLoader(dataset=data, batch_size=torch.cuda.device_count())
+loader = DataLoader(dataset=data, batch_size=1)
 
 #resize token embeddings
 model.resize_token_embeddings(len(data.tokenizer))
 
 #Set up optimizer
-opt = AdamW([model.parameters(), projection.parameters()], lr=learning_rate, weight_decay=weight_decay)
+opt = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-for batch, data_elem in tqdm(enumerate(loader)):
+#Set up progress bar
+pbar = tqdm(enumerate(loader), total=len(data))
+loss_progress = 0.0
+
+#Update the pbar description every 20 batches
+report_loss_every = 20
+#save every 10000 batches
+save_every = 10000
+
+for batch, data_elem in pbar:
     model_input = {
         'input_ids':data_elem['input_ids'],
         'attention_mask':data_elem['attention_mask'],
@@ -165,12 +174,12 @@ for batch, data_elem in tqdm(enumerate(loader)):
     if data_elem['use_distill']:
         #out_embeds ~ (b x seq_len x hidden_size)
         idx = data_elem['clip_idx']
-        last_layer = out_embeds[-1] # -1 for last layer
-
+        last_layer = out_embeds[-1].squeeze() # -1 for last layer
         #Get predicted clip embedding. Grab from sequence_len dimension
         clip_embeds = torch.zeros((data.clip_batch_size, neo_hidden)).to(device)
-        for i,j in enumerate(idx):
+        for i,j in enumerate(idx.tolist()[0]):
             clip_embeds[i] = last_layer[i][j]
+
         #Project to the correct size
         clip_embeds = projection(clip_embeds)
         #Compute contrastive loss
@@ -180,11 +189,23 @@ for batch, data_elem in tqdm(enumerate(loader)):
     n_text_toks = data_elem['clip_idx'].sum()
     loss += ar_loss(model, data_elem['input_ids'], data_elem['attention_mask']) / n_text_toks
 
-    print(float(loss))
     loss.backward()
+    #loss_progress += loss.detatch().cpu().item()
+    
+    #Accumulate gradients
     if (batch+1)%grad_accum==0:
         opt.step()
         opt.zero_grad()
-    #Validation loop?
 
-    break
+    #Update loss progress
+    if (batch+1)%report_loss_every==0:
+        loss_progress /= float(report_loss_every)
+        pbar.set_description("Current loss: " + str(loss_progress))
+        loss_progress = 0.0
+    #Save model
+    if (batch+1)%save_every==0:
+        model.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
+        tokenizer.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
+
+model.save_pretrained("GPT-Neo-Enriched")
+tokenizer.save_pretrained("GPT-Neo-Enriched")
