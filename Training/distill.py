@@ -5,12 +5,18 @@ from lm_dataformat import *
 import torch
 import torch.nn.functional as F
 from torch.nn.functional import normalize, cross_entropy
+from torch.nn import DataParallel
+from auto_tqdm import tqdm
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 #initalize a smol boi
 config = GPTNeoConfig(hidden_size = 128, num_layers = 24, attention_layers = 24)
 #create model
-model = GPTNeoForCausalLM(config).to(device)
+model = GPTNeoForCausalLM(config)
+if torch.cuda.device_count() > 1:
+    model = DataParallel(model)
+model.to(device)
 tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-1.3B")
 
 #Initialize a random projection matrix
@@ -24,6 +30,8 @@ temperature = 1.0
 learning_rate = 5e-5
 weight_decay = 0
 grad_accum = 2
+clip_bs = 8
+lambda_coeff = 1.0 #relative scale for contrastive loss
 
 temp_tensor = torch.tensor(temperature).to(device)
 
@@ -131,16 +139,18 @@ def ar_loss(model, inp, attn_mask):
 
 
 #Load dataset
-data = DistillDataset(tokenizer = tokenizer, clip_batch_size = 8,\
+data = DistillDataset(tokenizer = tokenizer, clip_batch_size = clip_bs,\
     clip_dataset_dir = "../clip_latents_100k.jsonl.zst",\
     pile_dataset_dir = "../val.jsonl.zst")
+loader = DataLoader(dataset=data, batch_size=torch.cuda.device_count())
+
 #resize token embeddings
 model.resize_token_embeddings(len(data.tokenizer))
 
 #Set up optimizer
 opt = AdamW([model.parameters(), projection.parameters()], lr=learning_rate, weight_decay=weight_decay)
 
-for batch, data_elem in enumerate(data):
+for batch, data_elem in tqdm(enumerate(loader)):
     model_input = {
         'input_ids':data_elem['input_ids'],
         'attention_mask':data_elem['attention_mask'],
@@ -164,7 +174,7 @@ for batch, data_elem in enumerate(data):
         #Project to the correct size
         clip_embeds = projection(clip_embeds)
         #Compute contrastive loss
-        loss = clip_loss(clip_embeds,  data_elem['latent_vecs'], temp_tensor)
+        loss = lambda_coeff * clip_loss(clip_embeds,  data_elem['latent_vecs'], temp_tensor)
 
     #compute AR loss
     n_text_toks = data_elem['clip_idx'].sum()
