@@ -13,10 +13,9 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 #initalize a smol boi
 config = GPTNeoConfig(hidden_size = 128, num_layers = 24, attention_layers = 24)
 #create model
-model = GPTNeoForCausalLM(config)
+model = GPTNeoForCausalLM.from_pretrained("EleutherAI/gpt-neo-1.3B")
 if torch.cuda.device_count() > 1:
     model_dp = DataParallel(model)
-
 model_dp.to(device)
 tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-1.3B")
 
@@ -31,7 +30,7 @@ temperature = 1.0
 learning_rate = 5e-5
 weight_decay = 0
 grad_accum = 2
-clip_bs = 8
+clip_bs = 128
 lambda_coeff = 1.0 #relative scale for contrastive loss
 
 temp_tensor = torch.tensor(temperature).to(device)
@@ -91,7 +90,7 @@ class DistillDataset(IterableDataset):
         #Tokenize text
         toks = tok.batch_encode_plus(txts, max_length=2048, truncation=True, padding=True, return_tensors="pt").to(device)
         #Get the index of the clip tokens.
-        clip_idx = (torch.sum(toks.attention_mask, dim=-1) - torch.tensor([1] * len(txts)).to(device))
+        clip_idx = (torch.sum(toks.attention_mask, dim=-1).to("cpu") - torch.tensor([1] * len(txts)))
         #Get latent vectors
         latents = torch.cat([torch.tensor(x) for x in img_latents], dim=0).to(device)
 
@@ -123,20 +122,20 @@ def clip_loss(a, b, temp):
 
 def ar_loss(model, inp, attn_mask):
     # inp :: [b, seq]
-    logprobs = F.log_softmax(model(inp, attention_mask=attn_mask, return_dict=True)['logits'], dim=-1)
+    logprobs = F.log_softmax(model(inp, attention_mask=attn_mask, return_dict=True)['logits'].squeeze(0), dim=-1)
     # logprobs :: [b, seq, vocab]
 
     pred = logprobs[:, :-1]
-    tgt = inp[:, 1:]
+    tgt = inp.squeeze(0)[:, 1:]
 
     is_clip_or_padding_token = tgt >= 50257
-
+    
     logits = torch.gather(pred, 2, tgt.unsqueeze(-1)).squeeze(-1) # [batch, seq-1]
 
     # remove loss of clip-token
     logits *= 1 - is_clip_or_padding_token.to(torch.int)
 
-    return logits.sum()
+    return -logits.sum()
 
 
 #Load dataset
@@ -166,6 +165,7 @@ for batch, data_elem in pbar:
         'input_ids':data_elem['input_ids'],
         'attention_mask':data_elem['attention_mask'],
     }
+    loss = None
     #Used for CLIP. TODO: Fetch AR loss (Leo pls do this)
     out_embeds = model_dp(**model_input, return_dict=True, output_hidden_states=True)['hidden_states']
     
@@ -175,11 +175,12 @@ for batch, data_elem in pbar:
     #If we are currently using contrastive loss
     if data_elem['use_distill']:
         #out_embeds ~ (b x seq_len x hidden_size)
-        idx = data_elem['clip_idx'].squeeze()
+        idx = data_elem['clip_idx']
         last_layer = out_embeds[-1].squeeze() # -1 for last layer
         #Get predicted clip embedding. Grab from sequence_len dimension
-        clip_embeds = torch.index_select(last_layer, 1, idx)
-        clip_embeds = torch.stack([clip_embeds[i][i].unsqueeze(0) for i in range(clip_bs)]).squeeze()
+        clip_embeds = torch.zeros((data.clip_batch_size, neo_hidden)).to(device)
+        for i,j in enumerate(idx.tolist()[0]):
+            clip_embeds[i] = last_layer[i][j]
 
         #Project to the correct size
         clip_embeds = projection(clip_embeds)
@@ -188,10 +189,13 @@ for batch, data_elem in pbar:
 
     #compute AR loss
     n_text_toks = data_elem['clip_idx'].sum()
-    loss += ar_loss(model_dp, data_elem['input_ids'], data_elem['attention_mask']) / n_text_toks
+    if loss is not None:
+        loss += ar_loss(model_dp, data_elem['input_ids'], data_elem['attention_mask']) / n_text_toks
+    else:
+        loss = ar_loss(model_dp, data_elem['input_ids'], data_elem['attention_mask']) / n_text_toks
 
     loss.backward()
-    #loss_progress += loss.detatch().cpu().item()
+    loss_progress += loss.detach().cpu().item()
     
     #Accumulate gradients
     if (batch+1)%grad_accum==0:
