@@ -123,11 +123,11 @@ def clip_loss(a, b, temp):
 
 def ar_loss(model, inp, attn_mask):
     # inp :: [b, seq]
-    logprobs = F.log_softmax(model(inp, attention_mask=attn_mask, return_dict=True)['logits'], dim=-1)
+    logprobs = F.log_softmax(model(inp, attention_mask=attn_mask, return_dict=True)['logits'].squeeze(0), dim=-1)
     # logprobs :: [b, seq, vocab]
 
     pred = logprobs[:, :-1]
-    tgt = inp[:, 1:]
+    tgt = inp.squeeze(0)[:, 1:]
 
     is_clip_or_padding_token = tgt >= 50257
 
@@ -137,7 +137,6 @@ def ar_loss(model, inp, attn_mask):
     logits *= 1 - is_clip_or_padding_token.to(torch.int)
 
     return logits.sum()
-
 
 #Load dataset
 data = DistillDataset(tokenizer = tokenizer, clip_batch_size = clip_bs,\
