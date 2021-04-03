@@ -137,7 +137,6 @@ def ar_loss(model, inp, attn_mask):
 
     return -logits.sum()
 
-
 #Load dataset
 data = DistillDataset(tokenizer = tokenizer, clip_batch_size = clip_bs,\
     clip_dataset_dir = "../clip_latents_100k.jsonl.zst",\
