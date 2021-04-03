@@ -16,6 +16,7 @@ config = GPTNeoConfig(hidden_size = 128, num_layers = 24, attention_layers = 24)
 model = GPTNeoForCausalLM(config)
 if torch.cuda.device_count() > 1:
     model_dp = DataParallel(model)
+
 model_dp.to(device)
 tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-1.3B")
 
@@ -90,7 +91,7 @@ class DistillDataset(IterableDataset):
         #Tokenize text
         toks = tok.batch_encode_plus(txts, max_length=2048, truncation=True, padding=True, return_tensors="pt").to(device)
         #Get the index of the clip tokens.
-        clip_idx = (torch.sum(toks.attention_mask, dim=-1).to("cpu") - torch.tensor([1] * len(txts)))
+        clip_idx = (torch.sum(toks.attention_mask, dim=-1) - torch.tensor([1] * len(txts)).to(device))
         #Get latent vectors
         latents = torch.cat([torch.tensor(x) for x in img_latents], dim=0).to(device)
 
@@ -174,16 +175,17 @@ for batch, data_elem in pbar:
     #If we are currently using contrastive loss
     if data_elem['use_distill']:
         #out_embeds ~ (b x seq_len x hidden_size)
-        idx = data_elem['clip_idx']
+        idx = data_elem['clip_idx'].squeeze()
         last_layer = out_embeds[-1].squeeze() # -1 for last layer
         #Get predicted clip embedding. Grab from sequence_len dimension
-        clip_embeds = torch.zeros((data.clip_batch_size, neo_hidden)).to(device)
-        for i,j in enumerate(idx.tolist()[0]):
-            clip_embeds[i] = last_layer[i][j]
+        clip_embeds = torch.index_select(last_layer, 1, idx)
+        clip_embeds = torch.stack([clip_embeds[i][i].unsqueeze(0) for i in range(clip_bs)]).squeeze()
 
         #Project to the correct size
         clip_embeds = projection(clip_embeds)
         #Compute contrastive loss
+        print(clip_embeds.size())
+        print(data_elem['latent_vecs'].size())
         loss = lambda_coeff * clip_loss(clip_embeds,  data_elem['latent_vecs'], temp_tensor)
 
     #compute AR loss
