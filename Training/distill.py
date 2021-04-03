@@ -22,7 +22,7 @@ tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-1.3B")
 #Initialize a random projection matrix
 neo_hidden = model.config.hidden_size
 clip_hidden = 512
-projection = torch.nn.Linear(neo_hidden, clip_hidden).to(device)
+projection = torch.nn.Linear(neo_hidden, clip_hidden, bias=False).to(device)
 
 
 #hparams
@@ -148,7 +148,7 @@ loader = DataLoader(dataset=data, batch_size=torch.cuda.device_count())
 model.resize_token_embeddings(len(data.tokenizer))
 
 #Set up optimizer
-opt = AdamW([model.parameters(), projection.parameters()], lr=learning_rate, weight_decay=weight_decay)
+opt = AdamW(list(model.parameters()) + list(projection.parameters()), lr=learning_rate, weight_decay=weight_decay)
 
 for batch, data_elem in tqdm(enumerate(loader)):
     model_input = {
