@@ -18,15 +18,23 @@
       "weight_decay": 0
     }
   },
+  
+  #activation checkpointing
+  "checkpoint-activations": true,
+  "checkpoint-num-layers": 1,
+  "partition-activations": true,
+  "synchronize-each-layer": true,
+  
   "gradient_clipping": 1.0,
-  "fp16": {
-    "enabled": true,
+  "fp16": { 
+     "fp16": true,
+     "enabled": true,
+     "loss_scale": 0,
+     "loss_scale_window": 1000,
+     "hysteresis": 2,
+     "min_loss_scale": 1
+   },
 
-    "loss_scale": 0,
-    "loss_scale_window": 1000,
-    "hysteresis": 2,
-    "min_loss_scale": 1
-  },
   "wall_clock_breakdown": true,
   "zero_allow_untested_optimizer": false
 }
