@@ -199,6 +199,7 @@ for batch, data_elem in pbar:
         n_text_toks = data_elem['clip_idx'].sum()
         loss = ar_loss(model_out) / n_text_toks
 
+
     #loss = model_engine(batch)
     model_engine.backward(loss)
     loss_progress += loss.detach().cpu().item()
