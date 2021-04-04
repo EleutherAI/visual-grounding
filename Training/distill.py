@@ -127,9 +127,9 @@ def clip_loss(a, b, temp):
     
     return loss / 2.0
 
-def ar_loss(logits, inp):
+def ar_loss(out_embeds):
     # inp :: [b, seq]
-    logprobs = F.log_softmax(logits.squeeze(0), dim=-1)
+    logprobs = F.log_softmax(out_embeds['logits'].squeeze(0), dim=-1)
     # logprobs :: [b, seq, vocab]
 
     pred = logprobs[:, :-1]
@@ -172,10 +172,11 @@ for batch, data_elem in pbar:
         'attention_mask':data_elem['attention_mask'],
     }
     loss = None
-    #Used for CLIP. TODO: Fetch AR loss (Leo pls do this)
-    out=model_engine(**model_input, return_dict=True, output_hidden_states=True)
-    out_embeds=out['hidden_states']
-    logits=out['logits']
+    
+    # compute model once for both CLIP and AR
+    model_out = model_engine(**model_input, return_dict=True, output_hidden_states=True)
+    out_embeds = model_out['hidden_states']
+    
     # debug shapes
     #print([(k, v.shape if isinstance(v, torch.Tensor) else v) for k, v in data_elem.items()])
 
@@ -193,14 +194,12 @@ for batch, data_elem in pbar:
         clip_embeds = projection(clip_embeds)
         #Compute contrastive loss
         loss = lambda_coeff * clip_loss(clip_embeds,  data_elem['latent_vecs'], temp_tensor)
-
-    #compute AR loss
-    n_text_toks = data_elem['clip_idx'].sum()
-    if loss is not None:
-        pass
-        #loss += ar_loss(model_engine, data_elem['input_ids'], data_elem['attention_mask']) / n_text_toks
     else:
-        loss = ar_loss(logits, data_elem['input_ids']) / n_text_toks
+        #compute AR loss if Pile data
+        n_text_toks = data_elem['clip_idx'].sum()
+        loss = ar_loss(model_out) / n_text_toks
+
+
     #loss = model_engine(batch)
     model_engine.backward(loss)
     loss_progress += loss.detach().cpu().item()
