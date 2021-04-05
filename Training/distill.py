@@ -83,6 +83,8 @@ class DistillDataset(IterableDataset):
             text, _ =next(self.pile_rdr)
             txts.append(text)
             #Place holder
+            #Tokenize text
+            toks = tok.batch_encode_plus(txts, max_length=2048, truncation=True, padding="max_length", return_tensors="pt").to(device)
             img_latents.append([[0]*clip_hidden])
         #Return an element from CLIP
         else:
@@ -94,8 +96,9 @@ class DistillDataset(IterableDataset):
                 txts.append(text)
                 img_latents.append([img_latent])
 
-        #Tokenize text
-        toks = tok.batch_encode_plus(txts, max_length=2048, truncation=True, padding=True, return_tensors="pt").to(device)
+            #Tokenize text
+            toks = tok.batch_encode_plus(txts, max_length=128, truncation=True, padding="max_length", return_tensors="pt").to(device)
+
         #Get the index of the clip tokens.
         clip_idx = (torch.sum(toks.attention_mask, dim=-1).to("cpu") - torch.tensor([1] * len(txts)))
         #Get latent vectors
@@ -127,7 +130,7 @@ def clip_loss(a, b, temp):
     
     return loss / 2.0
 
-def ar_loss(out_embeds):
+def ar_loss(out_embeds, inp):
     # inp :: [b, seq]
     logprobs = F.log_softmax(out_embeds['logits'].squeeze(0), dim=-1)
     # logprobs :: [b, seq, vocab]
@@ -167,6 +170,7 @@ report_loss_every = 20
 save_every = 10000
 
 for batch, data_elem in pbar:
+    torch.cuda.empty_cache()
     model_input = {
         'input_ids':data_elem['input_ids'],
         'attention_mask':data_elem['attention_mask'],
@@ -197,7 +201,7 @@ for batch, data_elem in pbar:
     else:
         #compute AR loss if Pile data
         n_text_toks = data_elem['clip_idx'].sum()
-        loss = ar_loss(model_out) / n_text_toks
+        loss = ar_loss(model_out, data_elem['input_ids']) / n_text_toks
 
 
     #loss = model_engine(batch)
