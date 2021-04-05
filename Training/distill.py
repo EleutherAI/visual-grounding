@@ -1,4 +1,4 @@
-from transformers import GPTNeoModel, GPTNeoForCausalLM,\
+from transformers import GPTNeoModel, AutoModelForCausalLM,\
     GPT2Tokenizer, GPTNeoConfig, AdamW
 from torch.utils.data import IterableDataset, DataLoader 
 from lm_dataformat import *
@@ -14,7 +14,7 @@ args = get_args()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 #create model, set neo_hidden
-model = GPTNeoForCausalLM.from_pretrained("EleutherAI/gpt-neo-1.3B")
+model = AutoModelForCausalLM.from_pretrained("EleutherAI/gpt-neo-1.3B")
 tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-1.3B")
 neo_hidden = model.config.hidden_size
 #resize token embeddings. Two extra tokens
@@ -69,11 +69,14 @@ class DistillDataset(IterableDataset):
         self.special_token_idx=len(self.tokenizer)
         self.tokenizer.add_tokens([special_token])
         self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+        self.i=0
     def __len__(self):
         return int(self.steps)
     def __iter__(self):
         return self
     def __next__(self):
+        self.i+=1
+        print("DATASET STEP", self.i)
         tok = self.tokenizer
         txts = list()
         img_latents = list()
@@ -86,6 +89,7 @@ class DistillDataset(IterableDataset):
             #Tokenize text
             toks = tok.batch_encode_plus(txts, max_length=2048, truncation=True, padding="max_length", return_tensors="pt").to(device)
             img_latents.append([[0]*clip_hidden])
+
         #Return an element from CLIP
         else:
             txts = list()
@@ -95,6 +99,7 @@ class DistillDataset(IterableDataset):
                 text += "<|CLIP|>"
                 txts.append(text)
                 img_latents.append([img_latent])
+
 
             #Tokenize text
             toks = tok.batch_encode_plus(txts, max_length=128, truncation=True, padding="max_length", return_tensors="pt").to(device)
@@ -113,11 +118,12 @@ class DistillDataset(IterableDataset):
             'clip_idx' : clip_idx, 
             'use_distill' : cc,
         }
-
+dev='cuda'
 #Contrastive loss helper function
 def clip_loss(a, b, temp):
     # a ~ (b x d)
     # b ~ (b x d)
+#    return torch.tensor(0.).to(dev).requires_grad_(True)
     batch_size, dimension = a.shape
 
     a_normd = normalize(a, p=2, dim=1).squeeze()
@@ -132,6 +138,7 @@ def clip_loss(a, b, temp):
 
 def ar_loss(out_embeds, inp):
     # inp :: [b, seq]
+#    return torch.tensor(0.).to(dev).requires_grad_(True)
     logprobs = F.log_softmax(out_embeds['logits'].squeeze(0), dim=-1)
     # logprobs :: [b, seq, vocab]
 
@@ -140,6 +147,9 @@ def ar_loss(out_embeds, inp):
 
     is_clip_or_padding_token = tgt >= 50257
     
+    print(pred.shape, tgt.shape)
+    return F.nll_loss(pred.squeeze(0), tgt.squeeze(0))
+
     logits = torch.gather(pred, 2, tgt.unsqueeze(-1)).squeeze(-1) # [batch, seq-1]
 
     # remove loss of clip-token
@@ -169,6 +179,7 @@ report_loss_every = 20
 #save every 10000 batches
 save_every = 10000
 
+
 for batch, data_elem in pbar:
     torch.cuda.empty_cache()
     model_input = {
@@ -176,19 +187,18 @@ for batch, data_elem in pbar:
         'attention_mask':data_elem['attention_mask'],
     }
     loss = None
-    
     # compute model once for both CLIP and AR
+#    return 
+
     model_out = model_engine(**model_input, return_dict=True, output_hidden_states=True)
-    out_embeds = model_out['hidden_states']
-    
-    # debug shapes
+    # denug shapes
     #print([(k, v.shape if isinstance(v, torch.Tensor) else v) for k, v in data_elem.items()])
 
     #If we are currently using contrastive loss
     if data_elem['use_distill']:
         #out_embeds ~ (b x seq_len x hidden_size)
         idx = data_elem['clip_idx']
-        last_layer = out_embeds[-1].squeeze() # -1 for last layer
+        last_layer = model_out["hidden_states"][-1].squeeze() # -1 for last layer
         #Get predicted clip embedding. Grab from sequence_len dimension
         clip_embeds = torch.zeros((data.clip_batch_size, neo_hidden)).to(device)
         for i,j in enumerate(idx.tolist()[0]):
@@ -198,16 +208,21 @@ for batch, data_elem in pbar:
         clip_embeds = projection(clip_embeds)
         #Compute contrastive loss
         loss = lambda_coeff * clip_loss(clip_embeds,  data_elem['latent_vecs'], temp_tensor)
+        loss_progress += float(loss.detach().cpu().item())
+
+        del idx, last_layer, clip_embeds
     else:
         #compute AR loss if Pile data
         n_text_toks = data_elem['clip_idx'].sum()
         loss = ar_loss(model_out, data_elem['input_ids']) / n_text_toks
-
-
-    #loss = model_engine(batch)
+        
+    torch.cuda.empty_cache()
     model_engine.backward(loss)
-    loss_progress += loss.detach().cpu().item()
-    
+
+        #loss = model_engine(batch)
+    #model_engine.backward(loss)
+    #loss_progress += loss.detach().cpu().item()
+    #del loss
     #Accumulate gradients
     if (batch+1)%grad_accum==0:
         model_engine.step()
@@ -225,7 +240,12 @@ for batch, data_elem in pbar:
         model_engine.save_checkpoint(args.save_dir, ckpt_id, client_sd=client_sd)
         #model.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
         tokenizer.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
+    del loss, model_input, data_elem, model_out
+    print(torch.cuda.memory_allocated(0))
+    torch.cuda.empty_cache()
 
+for batch, data_elem in pbar:
+    train_step(batch, data_elem)
 model_engine.save_checkpoint(args.save_dir, ckpt_id, client_sd=client_sd)
 #model.save_pretrained("GPT-Neo-Enriched")
 tokenizer.save_pretrained("GPT-Neo-Enriched")

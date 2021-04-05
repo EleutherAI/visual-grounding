@@ -1,5 +1,5 @@
 {
-  "train_batch_size": 2048,
+  "train_batch_size": 64,
   "gradient_accumulation_steps": 2,
   "steps_per_print": 1,
   "zero_optimization": {
@@ -8,7 +8,9 @@
     "reduce_scatter": true,
     "allgather_bucket_size": 50000000,
     "reduce_bucket_size": 50000000,
-    "overlap_comm": true
+    "overlap_comm": true,
+    "contiguous_gradients": true,
+    "cpu_offload": true
   },
   "optimizer": {
     "type": "AdamW",
@@ -18,23 +20,15 @@
       "weight_decay": 0
     }
   },
-  
-  # activation checkpointing
-  "checkpoint-activations": true,
-  "checkpoint-num-layers": 1,
-  "partition-activations": true,
-  "synchronize-each-layer": true,
-  
   "gradient_clipping": 1.0,
-  "fp16": { 
-     "fp16": true,
-     "enabled": true,
-     "loss_scale": 0,
-     "loss_scale_window": 1000,
-     "hysteresis": 2,
-     "min_loss_scale": 1
-   },
+  "fp16": {
+    "enabled": true,
 
-  "wall_clock_breakdown": true,
+    "loss_scale": 0,
+    "loss_scale_window": 1000,
+    "hysteresis": 2,
+    "min_loss_scale": 1
+  },
+  "wall_clock_breakdown": false,
   "zero_allow_untested_optimizer": false
 }
