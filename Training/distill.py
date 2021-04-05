@@ -83,12 +83,13 @@ class DistillDataset(IterableDataset):
     
         #Return an element from the pile
         if not self.cur_clip:
-            for _ in range(1):
+            text, _ =next(self.pile_rdr)
+            txts.append(text)
+            #Place holder
+            #Tokenize text
+            toks = tok.batch_encode_plus(txts, max_length=2048, truncation=True, padding="max_length", return_tensors="pt").to(device)
+            img_latents.append([[0]*clip_hidden])
 
-                text, _ =next(self.pile_rdr)
-                txts.append(text)
-                #Place holder
-                img_latents.append([[0]*clip_hidden])
         #Return an element from CLIP
         else:
             txts = list()
@@ -99,8 +100,10 @@ class DistillDataset(IterableDataset):
                 txts.append(text)
                 img_latents.append([img_latent])
 
-        #Tokenize text
-        toks = tok.batch_encode_plus(txts, max_length=1024, truncation=True, return_tensors="pt", pad_to_multiple_of=8, padding=True).to(device)
+
+            #Tokenize text
+            toks = tok.batch_encode_plus(txts, max_length=128, truncation=True, padding="max_length", return_tensors="pt").to(device)
+
         #Get the index of the clip tokens.
         clip_idx = (torch.sum(toks.attention_mask, dim=-1).to("cpu") - torch.tensor([1] * len(txts)))
         #Get latent vectors
@@ -176,20 +179,9 @@ report_loss_every = 20
 #save every 10000 batches
 save_every = 10000
 
-#input("waiting on input")
-import gc
-def train_step(batch, data_elem):
-    if batch < 50: 
-        print('batch skip',batch)
-        return
-    global loss_progress
-    gc.collect()
+
+for batch, data_elem in pbar:
     torch.cuda.empty_cache()
-    print(torch.cuda.memory_summary(device=device, abbreviated=False))
-#    time.sleep(3)
-    print(data_elem['input_ids'].shape)
-    print(data_elem)
-#   if data_elem['input_ids'].shape[-1] > 1000: return
     model_input = {
         'input_ids':data_elem['input_ids'],
         'attention_mask':data_elem['attention_mask'],
@@ -221,9 +213,9 @@ def train_step(batch, data_elem):
         del idx, last_layer, clip_embeds
     else:
         #compute AR loss if Pile data
-        n_text_toks = data_elem['clip_idx'].sum().detach()
-        loss = ar_loss(model_out, model_input['input_ids']) / n_text_toks
-
+        n_text_toks = data_elem['clip_idx'].sum()
+        loss = ar_loss(model_out, data_elem['input_ids']) / n_text_toks
+        
     torch.cuda.empty_cache()
     model_engine.backward(loss)
 
