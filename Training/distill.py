@@ -14,7 +14,10 @@ args = get_args()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 #create model, set neo_hidden
-model = AutoModelForCausalLM.from_pretrained("EleutherAI/gpt-neo-1.3B")
+conf = GPTNeoConfig.from_pretrained("EleutherAI/gpt-neo-1.3B")
+conf.gradient_checkpointing = True
+model = GPTNeoForCausalLM.from_pretrained("EleutherAI/gpt-neo-1.3B", config=conf)
+model.training = True
 tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-1.3B")
 neo_hidden = model.config.hidden_size
 #resize token embeddings. Two extra tokens
@@ -126,8 +129,8 @@ def clip_loss(a, b, temp):
 #    return torch.tensor(0.).to(dev).requires_grad_(True)
     batch_size, dimension = a.shape
 
-    a_normd = normalize(a, p=2, dim=1).squeeze()
-    b_normd = normalize(b, p=2, dim=1).squeeze()
+    a_normd = normalize(a, p=2, dim=1).squeeze().to(torch.float32)
+    b_normd = normalize(b, p=2, dim=1).squeeze().to(torch.float32)
     logits = torch.einsum('i d, j d -> i j', a_normd, b_normd) * temp.exp()
 
     labels = torch.arange(batch_size).to(device)
@@ -138,8 +141,8 @@ def clip_loss(a, b, temp):
 
 def ar_loss(out_embeds, inp):
     # inp :: [b, seq]
-#    return torch.tensor(0.).to(dev).requires_grad_(True)
-    logprobs = F.log_softmax(out_embeds['logits'].squeeze(0), dim=-1)
+    logprobs = F.log_softmax(out_embeds['logits'].squeeze(0), dim=-1).to(torch.float32)
+
     # logprobs :: [b, seq, vocab]
 
     pred = logprobs[:, :-1]
@@ -191,7 +194,13 @@ for batch, data_elem in pbar:
 #    return 
 
     model_out = model_engine(**model_input, return_dict=True, output_hidden_states=True)
-    # denug shapes
+    out_embeds = model_out['hidden_states']
+    #print("Layers:\n\n")
+    #print(out_embeds[-1])
+    #print("Logits:\n\n")
+    #print(model_out['logits'])
+    # debug shapes
+
     #print([(k, v.shape if isinstance(v, torch.Tensor) else v) for k, v in data_elem.items()])
 
     #If we are currently using contrastive loss
@@ -215,18 +224,13 @@ for batch, data_elem in pbar:
         #compute AR loss if Pile data
         n_text_toks = data_elem['clip_idx'].sum()
         loss = ar_loss(model_out, data_elem['input_ids']) / n_text_toks
-        
-    torch.cuda.empty_cache()
-    model_engine.backward(loss)
-
-        #loss = model_engine(batch)
-    #model_engine.backward(loss)
-    #loss_progress += loss.detach().cpu().item()
-    #del loss
-    #Accumulate gradients
-    if (batch+1)%grad_accum==0:
+    print(loss)
+    #loss = model_engine(batch)
+    if not torch.any(loss.isnan()):
+        model_engine.backward(loss.to(torch.float32))
         model_engine.step()
-        model_engine.zero_grad()
+        loss_progress += loss.to(torch.float32).detach().cpu().item()
+    
 
     #Update loss progress
     if (batch+1)%report_loss_every==0:
