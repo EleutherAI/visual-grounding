@@ -40,7 +40,7 @@ temperature = 1.0
 learning_rate = 5e-5
 weight_decay = 0
 grad_accum = 2
-clip_bs = 8
+clip_bs = 48
 lambda_coeff = 1.0 #relative scale for contrastive loss
 
 temp_tensor = torch.tensor(temperature).to(device)
@@ -87,7 +87,7 @@ class DistillDataset(IterableDataset):
             txts.append(text)
             #Place holder
             #Tokenize text
-            toks = tok.batch_encode_plus(txts, max_length=2048, truncation=True, padding="max_length", return_tensors="pt").to(device)
+            toks = tok.batch_encode_plus(txts, max_length=1024, truncation=True, padding="max_length", return_tensors="pt").to(device)
             img_latents.append([[0]*clip_hidden])
         #Return an element from CLIP
         else:
@@ -166,6 +166,7 @@ except:
 #Set up progress bar
 pbar = tqdm(enumerate(loader), total=len(data))
 loss_progress = 0.0
+loss_step_count = 0
 
 #Update the pbar description every 20 batches
 report_loss_every = 20
@@ -208,19 +209,21 @@ for batch, data_elem in pbar:
         #compute AR loss if Pile data
         n_text_toks = data_elem['clip_idx'].sum()
         loss = ar_loss(model_out, data_elem['input_ids']) / n_text_toks
-    print(loss)
     #loss = model_engine(batch)
+    print(loss)
     if not torch.any(loss.isnan()):
         model_engine.backward(loss.to(torch.float32))
         model_engine.step()
         loss_progress += loss.to(torch.float32).detach().cpu().item()
+        loss_step_count += 1
     
 
     #Update loss progress
     if (batch+1)%report_loss_every==0:
-        loss_progress /= float(report_loss_every)
+        loss_progress /= float(loss_step_count)
         pbar.set_description("Current loss: " + str(loss_progress))
         loss_progress = 0.0
+        loss_step_count = 0 
     #Save model
     if (batch+1)%save_every==0:
         client_sd['step'] = step
