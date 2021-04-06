@@ -22,17 +22,14 @@ tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-1.3B")
 neo_hidden = model.config.hidden_size
 #resize token embeddings. Two extra tokens
 model.resize_token_embeddings(len(tokenizer)+2)
-
 #Set up deep speed
 model_engine, optimizer, _, _ = deepspeed.initialize(args=args,
                                                         model=model,
                                                         model_parameters=model.parameters())
-#Cast to device
-model_engine.to(device)
-
+model_engine.to(model_engine.local_rank)
 #Initialize a random projection matrix
 clip_hidden = 512
-projection = torch.nn.Linear(neo_hidden, clip_hidden, bias=False).to(device)
+projection = torch.nn.Linear(neo_hidden, clip_hidden, bias=False).to(model_engine.local_rank)
 
 
 #hparams
@@ -43,7 +40,7 @@ grad_accum = 2
 clip_bs = 48
 lambda_coeff = 1.0 #relative scale for contrastive loss
 
-temp_tensor = torch.tensor(temperature).to(device)
+temp_tensor = torch.tensor(temperature).to(model_engine.local_rank)
 
 #pytorch dataset for clip juicing
 class DistillDataset(IterableDataset):
@@ -87,7 +84,7 @@ class DistillDataset(IterableDataset):
             txts.append(text)
             #Place holder
             #Tokenize text
-            toks = tok.batch_encode_plus(txts, max_length=1024, truncation=True, padding="max_length", return_tensors="pt").to(device)
+            toks = tok.batch_encode_plus(txts, max_length=512, truncation=True, padding="max_length", return_tensors="pt").to(model_engine.local_rank)
             img_latents.append([[0]*clip_hidden])
         #Return an element from CLIP
         else:
@@ -100,12 +97,12 @@ class DistillDataset(IterableDataset):
                 img_latents.append([img_latent])
 
             #Tokenize text
-            toks = tok.batch_encode_plus(txts, max_length=128, truncation=True, padding="max_length", return_tensors="pt").to(device)
+            toks = tok.batch_encode_plus(txts, max_length=128, truncation=True, padding="max_length", return_tensors="pt").to(model_engine.local_rank)
 
         #Get the index of the clip tokens.
         clip_idx = (torch.sum(toks.attention_mask, dim=-1).to("cpu") - torch.tensor([1] * len(txts)))
         #Get latent vectors
-        latents = torch.cat([torch.tensor(x) for x in img_latents], dim=0).to(device)
+        latents = torch.cat([torch.tensor(x) for x in img_latents], dim=0).to(model_engine.local_rank)
 
         cc = self.cur_clip
         #Flip cur clip
@@ -127,7 +124,7 @@ def clip_loss(a, b, temp):
     b_normd = normalize(b, p=2, dim=1).squeeze().to(torch.float32)
     logits = torch.einsum('i d, j d -> i j', a_normd, b_normd) * temp.exp()
 
-    labels = torch.arange(batch_size).to(device)
+    labels = torch.arange(batch_size).to(model_engine.local_rank)
 
     loss = cross_entropy(logits, labels) + cross_entropy(logits.T, labels)
     
@@ -152,8 +149,8 @@ def ar_loss(out_embeds, inp):
 
 #Load dataset
 data = DistillDataset(tokenizer = tokenizer, clip_batch_size = clip_bs,\
-    clip_dataset_dir = "../../../clip_latents_100k.jsonl.zst",\
-    pile_dataset_dir = "../../../val.jsonl.zst")
+    clip_dataset_dir = "../../clip/",\
+    pile_dataset_dir = "../../val.jsonl.zst")
 loader = DataLoader(dataset=data, batch_size=1)
 
 #Check to see if a checkpoint exists. if it does, load that. Otherwise assume we are on step zero.
@@ -197,7 +194,7 @@ for batch, data_elem in pbar:
         idx = data_elem['clip_idx']
         last_layer = out_embeds[-1].squeeze() # -1 for last layer
         #Get predicted clip embedding. Grab from sequence_len dimension
-        clip_embeds = torch.zeros((data.clip_batch_size, neo_hidden)).to(device)
+        clip_embeds = torch.zeros((data.clip_batch_size, neo_hidden)).to(model_engine.local_rank)
         for i,j in enumerate(idx.tolist()[0]):
             clip_embeds[i] = last_layer[i][j]
 
@@ -210,7 +207,6 @@ for batch, data_elem in pbar:
         n_text_toks = data_elem['clip_idx'].sum()
         loss = ar_loss(model_out, data_elem['input_ids']) / n_text_toks
     #loss = model_engine(batch)
-    print(loss)
     if not torch.any(loss.isnan()):
         model_engine.backward(loss.to(torch.float32))
         model_engine.step()
@@ -226,6 +222,7 @@ for batch, data_elem in pbar:
         loss_step_count = 0 
     #Save model
     if (batch+1)%save_every==0:
+        torch.distributed.barrier()
         client_sd['step'] = step
         ckpt_id = loss.item()
         model_engine.save_checkpoint(args.save_dir, ckpt_id, client_sd=client_sd)

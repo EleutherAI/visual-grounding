@@ -1,6 +1,6 @@
 {
-  "train_batch_size": 32,
-  "gradient_accumulation_steps": 32,
+  "train_micro_batch_size_per_gpu":1,
+  "gradient_accumulation_steps": 16,
   "steps_per_print": 2000,
   "zero_optimization": {
     "stage": 2,
@@ -9,7 +9,7 @@
     "allgather_bucket_size": 50000000,
     "reduce_bucket_size": 50000000,
     "overlap_comm":true,
-    "cpu_offload":true,
+    "cpu_offload":false,
     "contiguous_gradients":true
   },
   "optimizer": {
