@@ -207,6 +207,7 @@ for batch, data_elem in pbar:
         n_text_toks = data_elem['clip_idx'].sum()
         loss = ar_loss(model_out, data_elem['input_ids']) / n_text_toks
     #loss = model_engine(batch)
+    print(loss)
     if not torch.any(loss.isnan()):
         model_engine.backward(loss.to(torch.float32))
         model_engine.step()
