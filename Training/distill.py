@@ -9,15 +9,21 @@ from torch.nn import DataParallel
 from auto_tqdm import tqdm
 from get_args import get_args
 import deepspeed
+import wandb
+
+
+#enable tf32
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 args = get_args()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 #create model, set neo_hidden
 conf = GPTNeoConfig.from_pretrained("EleutherAI/gpt-neo-1.3B")
 conf.gradient_checkpointing = True
 model = GPTNeoForCausalLM.from_pretrained("EleutherAI/gpt-neo-1.3B", config=conf)
 model.training = True
+
 tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-1.3B")
 neo_hidden = model.config.hidden_size
 #resize token embeddings. Two extra tokens
@@ -27,6 +33,11 @@ model_engine, optimizer, _, _ = deepspeed.initialize(args=args,
                                                         model=model,
                                                         model_parameters=model.parameters())
 model_engine.to(model_engine.local_rank)
+
+#Set up wandb
+if model_engine.local_rank == 0:
+    wandb.init(project='speedrun', entity='eleutherai')
+
 #Initialize a random projection matrix
 clip_hidden = 512
 projection = torch.nn.Linear(neo_hidden, clip_hidden, bias=False).to(model_engine.local_rank)
@@ -38,9 +49,21 @@ learning_rate = 5e-5
 weight_decay = 0
 grad_accum = 2
 clip_bs = 48
-lambda_coeff = 1.0 #relative scale for contrastive loss
+lambda_coeff = 0.75 #relative scale for contrastive loss
 
 temp_tensor = torch.tensor(temperature).to(model_engine.local_rank)
+
+
+if model_engine.local_rank == 0:
+    config=wandb.config
+    config.learning_rate=learning_rate
+    config.temp=temperature
+    config.weight_decay=weight_decay
+    config.clip_batch_suze=clip_bs
+    config.lambda_c=lambda_coeff
+
+    wandb.watch(model)
+
 
 #pytorch dataset for clip juicing
 class DistillDataset(IterableDataset):
@@ -165,10 +188,16 @@ pbar = tqdm(enumerate(loader), total=len(data))
 loss_progress = 0.0
 loss_step_count = 0
 
+ar_loss_progress = 0.0
+ar_step_count = 0
+
+clip_loss_progress = 0.0
+clip_step_count = 0
+
 #Update the pbar description every 20 batches
 report_loss_every = 20
 #save every 10000 batches
-save_every = 10000
+save_every = 3000
 
 for batch, data_elem in pbar:
     torch.cuda.empty_cache()
@@ -207,28 +236,42 @@ for batch, data_elem in pbar:
         n_text_toks = data_elem['clip_idx'].sum()
         loss = ar_loss(model_out, data_elem['input_ids']) / n_text_toks
     #loss = model_engine(batch)
-    print(loss)
     if not torch.any(loss.isnan()):
         model_engine.backward(loss.to(torch.float32))
         model_engine.step()
         loss_progress += loss.to(torch.float32).detach().cpu().item()
         loss_step_count += 1
-    
 
+        if data_elem['use_distill']:
+            clip_loss_progress += loss.to(torch.float32).detach().cpu().item()
+            clip_step_count += 1
+        else:
+            ar_loss_progress += loss.to(torch.float32).detach().cpu().item()
+            ar_step_count += 1
+
+    
     #Update loss progress
     if (batch+1)%report_loss_every==0:
         loss_progress /= float(loss_step_count)
+        if model_engine.local_rank == 0:
+            clip_loss_progress /= float(clip_step_count)
+            clip_step_count = 0
+
+            ar_loss_progress /= float(ar_step_count)
+            ar_step_count = 0
+            wandb.log({'CLIP loss': clip_loss_progress, 'AR loss': ar_loss_progress, 'Loss' : loss_progress})
         pbar.set_description("Current loss: " + str(loss_progress))
         loss_progress = 0.0
+        clip_loss_progress = 0.0
+        ar_loss_progress = 0.0
         loss_step_count = 0 
     #Save model
     if (batch+1)%save_every==0:
         torch.distributed.barrier()
-        client_sd['step'] = step
         ckpt_id = loss.item()
-        model_engine.save_checkpoint(args.save_dir, ckpt_id, client_sd=client_sd)
+        model_engine.save_checkpoint("models/", ckpt_id)
         #model.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
-        tokenizer.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
+        #tokenizer.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
 
 model_engine.save_checkpoint(args.save_dir, ckpt_id, client_sd=client_sd)
 #model.save_pretrained("GPT-Neo-Enriched")
