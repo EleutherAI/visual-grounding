@@ -50,6 +50,7 @@ weight_decay = 0
 grad_accum = 2
 clip_bs = 48
 lambda_coeff = 0.75 #relative scale for contrastive loss
+mixing_ratio = 3 #Ratio of pile examples to CLIP examples 
 
 temp_tensor = torch.tensor(temperature).to(model_engine.local_rank)
 
@@ -83,7 +84,7 @@ class DistillDataset(IterableDataset):
         self.clip_batch_size = clip_batch_size
 
         #Start on an example of WIT.
-        self.cur_clip = True
+        self.mix_step = 0 
 
         #Store special token, add to tokenizer. Remember to resize token embeddings on model!
         self.tokenizer = tokenizer
@@ -100,9 +101,16 @@ class DistillDataset(IterableDataset):
         tok = self.tokenizer
         txts = list()
         img_latents = list()
-    
+
+        use_clip = False
+        #Mixing
+        self.mix_step += 1
+        if self.mix_step % mixing_ratio==0:
+            use_clip=True
+            self.mix_step=0
+
         #Return an element from the pile
-        if not self.cur_clip:
+        if not use_clip:
             text, _ =next(self.pile_rdr)
             txts.append(text)
             #Place holder
@@ -126,15 +134,12 @@ class DistillDataset(IterableDataset):
         clip_idx = (torch.sum(toks.attention_mask, dim=-1).to("cpu") - torch.tensor([1] * len(txts)))
         #Get latent vectors
         latents = torch.cat([torch.tensor(x) for x in img_latents], dim=0).to(model_engine.local_rank)
-
-        cc = self.cur_clip
-        #Flip cur clip
-        self.cur_clip = not self.cur_clip 
+        
         return {
             **toks,
             'latent_vecs' : latents,
             'clip_idx' : clip_idx, 
-            'use_distill' : cc,
+            'use_distill' : use_clip,
         }
 
 #Contrastive loss helper function
@@ -194,10 +199,10 @@ ar_step_count = 0
 clip_loss_progress = 0.0
 clip_step_count = 0
 
-#Update the pbar description every 20 batches
-report_loss_every = 20
-#save every 10000 batches
-save_every = 3000
+#Update the pbar description every 10 batches
+report_loss_every = 10
+#save every 500 batches
+save_every = 500
 
 for batch, data_elem in pbar:
     torch.cuda.empty_cache()
