@@ -6,8 +6,6 @@ def get_args():
 
     parser = deepspeed.add_config_arguments(parser)
     group = parser.add_argument_group(title='input data')
-    group.add_argument('--input', type=str, required=True,
-                       help='Path to input JSON')
     group.add_argument('--json-keys', nargs='+', default=['text'],
                        help='space separate listed of keys to extract from json')
     group.add_argument('--split-sentences', action='store_true',
@@ -16,10 +14,6 @@ def get_args():
                        help='Keep newlines between sentences when splitting.')
 
     group = parser.add_argument_group(title='tokenizer')
-    group.add_argument('--tokenizer-type', type=str, required=True,
-                       choices=['BertWordPieceLowerCase','BertWordPieceCase',
-                                'GPT2BPETokenizer'],
-                       help='What type of tokenizer to use.')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file')
     group.add_argument('--merge-file', type=str, default=None,
@@ -37,15 +31,12 @@ def get_args():
     group = parser.add_argument_group(title='runtime')
     group.add_argument('--workers', type=int, default=1,
                        help='Number of worker processes to launch')
+    group.add_argument('--local_rank', type=int, default=-1)
     group.add_argument('--log-interval', type=int, default=100,
                        help='Interval between progress updates')
 
     args = parser.parse_args()
     args.keep_empty = False
-
-    if args.tokenizer_type.lower().startswith('bert'):
-        if not args.split_sentences:
-            print("Bert tokenizer detected, are you sure you don't want to split sentences?")
 
     # some default/dummy values for the tokenizer
     args.rank = 0
