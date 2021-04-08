@@ -57,6 +57,9 @@ model_engine, optimizer, _, _ = deepspeed.initialize(args=args,
                                                         model_parameters=wrapper.parameters())
 model_engine.to(model_engine.local_rank)
 #projection = projection.to(model_engine.local_rank)
+
+
+
 #Set up wandb
 if model_engine.local_rank == 0:
     wandb.init(project='speedrun', entity='eleutherai')
@@ -191,7 +194,7 @@ def clip_loss(a, b, temp):
 
 def ar_loss(out_embeds, inp):
     # inp :: [b, seq]
-    logprobs = F.log_softmax(out_embeds['logits'].squeeze(0), dim=-1).to(torch.float32)
+    logprobs = F.log_softmax(out_embeds['logits'].squeeze(0)[:, :, :50257], dim=-1).to(torch.float32)
     # logprobs :: [b, seq, vocab]
 
     pred = logprobs[:, :-1]
