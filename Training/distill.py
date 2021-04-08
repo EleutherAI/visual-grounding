@@ -41,16 +41,23 @@ model.resize_token_embeddings(len(tokenizer)+2)
 #Initialize a random projection matrix
 clip_hidden = 512
 projection = torch.nn.Linear(neo_hidden, clip_hidden, bias=False)
+projection.half()
 #Set up deep speed
 #print(list(projection.parameters()))
+class ModelWrapper(torch.nn.Module):
+    def __init__(self, lm, proj):
+        super(ModelWrapper, self).__init__()
+        self.lm = lm
+        self.proj = proj
+    def forward(self, **kwargs):
+        return self.lm(**kwargs)
+wrapper = ModelWrapper(model, projection)
 model_engine, optimizer, _, _ = deepspeed.initialize(args=args,
-                                                        model=model,
-                                                        model_parameters=\
-                                                            (model.parameters())
-#                                                            +list(projection.parameters())
-                                                            )
+                                                        model=wrapper,
+                                                        model_parameters=wrapper.parameters())
 model_engine.to(model_engine.local_rank)
-projection = projection.to(model_engine.local_rank)
+#projection = projection.to(model_engine.local_rank)
+
 #Set up wandb
 if model_engine.local_rank == 0:
     wandb.init(project='speedrun', entity='eleutherai')
@@ -236,8 +243,8 @@ text_so_far = list()
 #Generate text samples occasionally
 def generate_from_template():
     if model_engine.local_rank == 0:
-        model_out = model.generate(input_ids=generate_template['input_ids'],\
-                max_length=128, bad_words_ids=[[data.special_token_idx],[data.special_token_idx+1]]).squeeze()
+        model_out = wrapper.lm.generate(input_ids=generate_template['input_ids'],\
+                max_length=128, bad_words_ids=[[data.special_token_idx],[data.special_token_idx+1]], no_repeat_ngram=5).squeeze()
         text = tokenizer.decode(model_out)
         print(text)
         #text_so_far.append(["EleutherAI is ", text])
@@ -259,14 +266,14 @@ for batch, data_elem in pbar:
     if data_elem['use_distill']:
         #out_embeds ~ (b x seq_len x hidden_size)
         idx = data_elem['clip_idx']
-        last_layer = out_embeds[-1].squeeze() # -1 for last layer
+        last_layer = out_embeds[-2].squeeze() # -1 for second to last layer
         #Get predicted clip embedding. Grab from sequence_len dimension
         clip_embeds = torch.zeros((data.clip_batch_size, neo_hidden)).to(model_engine.local_rank)
         for i,j in enumerate(idx.tolist()[0]):
             clip_embeds[i] = last_layer[i][j]
 
         #Project to the correct size
-        clip_embeds = projection(clip_embeds)
+        clip_embeds = wrapper.proj(clip_embeds.to(torch.float16))
         #Compute contrastive loss
         loss = lambda_coeff * clip_loss(clip_embeds,  data_elem['latent_vecs'], temp_tensor)
     else:
@@ -312,7 +319,7 @@ for batch, data_elem in pbar:
         #model_engine.module.save_pretrained(wandb.run.dir)
         # local or global?
         if model_engine.local_rank == 0:
-            model_engine.module.save_pretrained(f"models/{wandb.run.name}/{ckpt_id}", ckpt_id)
+            model_engine.module.lm.save_pretrained(f"models/{wandb.run.name}/{ckpt_id}", ckpt_id)
         #model.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
         #tokenizer.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
 
