@@ -192,7 +192,7 @@ def clip_loss(a, b, temp):
 
 def ar_loss(out_embeds, inp):
     # inp :: [b, seq]
-    logprobs = F.log_softmax(out_embeds['logits'].squeeze(0), dim=-1).to(torch.float32)
+    logprobs = F.log_softmax(out_embeds['logits'].squeeze(0)[:, :, :50257], dim=-1).to(torch.float32)
     # logprobs :: [b, seq, vocab]
 
     pred = logprobs[:, :-1]
