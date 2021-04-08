@@ -37,19 +37,20 @@ tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-1.3B")
 neo_hidden = model.config.hidden_size
 #resize token embeddings. Two extra tokens
 model.resize_token_embeddings(len(tokenizer)+2)
+#Initialize a random projection matrix
+clip_hidden = 512
+projection = torch.nn.Linear(neo_hidden, clip_hidden, bias=False).to(model_engine.local_rank)
 #Set up deep speed
 model_engine, optimizer, _, _ = deepspeed.initialize(args=args,
                                                         model=model,
-                                                        model_parameters=model.parameters())
+                                                        model_parameters=\
+                                                            list(model.parameters())+list(projection.parameters()))
 model_engine.to(model_engine.local_rank)
-
+projection.to(model_engine.local_rank)
 #Set up wandb
 if model_engine.local_rank == 0:
     wandb.init(project='speedrun', entity='eleutherai')
 
-#Initialize a random projection matrix
-clip_hidden = 512
-projection = torch.nn.Linear(neo_hidden, clip_hidden, bias=False).to(model_engine.local_rank)
 
 
 #hparams
