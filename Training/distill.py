@@ -15,7 +15,7 @@ import wandb
 # set random
 import torch
 torch.manual_seed(42)
-inport random
+import random
 random.seed(42)
 import numpy as np
 np.random.seed(42)
