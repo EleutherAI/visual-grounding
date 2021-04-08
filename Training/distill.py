@@ -58,6 +58,8 @@ model_engine, optimizer, _, _ = deepspeed.initialize(args=args,
 model_engine.to(model_engine.local_rank)
 #projection = projection.to(model_engine.local_rank)
 
+
+
 #Set up wandb
 if model_engine.local_rank == 0:
     wandb.init(project='speedrun', entity='eleutherai')
