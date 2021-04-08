@@ -12,6 +12,15 @@ import deepspeed
 import wandb
 
 
+# set random
+import torch
+torch.manual_seed(42)
+inport random
+random.seed(42)
+import numpy as np
+np.random.seed(42)
+
+
 #enable tf32
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -64,6 +73,8 @@ if model_engine.local_rank == 0:
     config.lambda_c=lambda_coeff
 
     wandb.watch(model)
+    
+    torch.save(projection, f"models/{wandb.run.name}/projection.pt")
 
 
 #pytorch dataset for clip juicing
