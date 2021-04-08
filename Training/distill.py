@@ -11,6 +11,14 @@ from get_args import get_args
 import deepspeed
 import wandb
 
+# set random
+import torch
+torch.manual_seed(42)
+inport random
+random.seed(42)
+import numpy as np
+np.random.seed(42)
+
 
 #enable tf32
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -64,6 +72,8 @@ if model_engine.local_rank == 0:
     config.lambda_c=lambda_coeff
 
     wandb.watch(model)
+    
+    torch.save(projection, f"models/{wandb.run.name}/projection.pt")
 
 
 #pytorch dataset for clip juicing
@@ -274,7 +284,8 @@ for batch, data_elem in pbar:
     if (batch+1)%save_every==0:
         torch.distributed.barrier()
         ckpt_id = loss.item()
-        model_engine.save_checkpoint("models/", ckpt_id)
+        if model_engine.local_rank == 0:
+            model_engine.module.save_pretrained(f"models/{wandb.run.name}/{ckpt_id}", ckpt_id)
         #model.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
         #tokenizer.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
 
