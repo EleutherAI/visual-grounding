@@ -11,7 +11,6 @@ from get_args import get_args
 import deepspeed
 import wandb
 
-
 #enable tf32
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -64,7 +63,7 @@ if model_engine.local_rank == 0:
     config.lambda_c=lambda_coeff
 
     wandb.watch(model)
-
+    torch.save(projection, f"models/{wandb.run.name}/projection.pt")
 
 #pytorch dataset for clip juicing
 class DistillDataset(IterableDataset):
