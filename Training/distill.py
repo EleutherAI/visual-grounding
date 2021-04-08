@@ -11,14 +11,6 @@ from get_args import get_args
 import deepspeed
 import wandb
 
-# set random
-import torch
-torch.manual_seed(42)
-inport random
-random.seed(42)
-import numpy as np
-np.random.seed(42)
-
 
 #enable tf32
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -72,8 +64,6 @@ if model_engine.local_rank == 0:
     config.lambda_c=lambda_coeff
 
     wandb.watch(model)
-    
-    torch.save(projection, f"models/{wandb.run.name}/projection.pt")
 
 
 #pytorch dataset for clip juicing
@@ -118,28 +108,35 @@ class DistillDataset(IterableDataset):
         if self.mix_step % mixing_ratio==0:
             use_clip=True
             self.mix_step=0
-
-        #Return an element from the pile
-        if not use_clip:
-            text, _ =next(self.pile_rdr)
-            txts.append(text)
-            #Place holder
-            #Tokenize text
-            toks = tok.batch_encode_plus(txts, max_length=512, truncation=True, padding="max_length", return_tensors="pt").to(model_engine.local_rank)
-            img_latents.append([[0]*clip_hidden])
-        #Return an element from CLIP
-        else:
-            txts = list()
-            for _ in range(self.clip_batch_size):
-                text, img_latent=next(self.clip_rdr)
-                #Append special token
-                text += "<|CLIP|>"
+        try:
+            #Return an element from the pile
+            if not use_clip:
+                text, _ =next(self.pile_rdr)
                 txts.append(text)
-                img_latents.append([img_latent])
+                #Tokenize text
+                toks = tok.batch_encode_plus(txts, max_length=512, truncation=True,\
+                    padding="max_length", return_tensors="pt").to(model_engine.local_rank)
+                img_latents.append([[0]*clip_hidden])
+            #Return an element from CLIP
+            else:
+                txts = list()
+                for _ in range(self.clip_batch_size):
+                    text, img_latent=next(self.clip_rdr)
+                    #Append special token
+                    text += "<|CLIP|>"
+                    txts.append(text)
+                    img_latents.append([img_latent])
 
-            #Tokenize text
-            toks = tok.batch_encode_plus(txts, max_length=128, truncation=True, padding="max_length", return_tensors="pt").to(model_engine.local_rank)
-
+                #Tokenize text
+                toks = tok.batch_encode_plus(txts, max_length=128, truncation=True,\
+                    padding="max_length", return_tensors="pt").to(model_engine.local_rank)
+        except:
+            #If the current file has issues, load the next one
+            if self.mix_step == 0:
+                self.mix_step = mixing_ratio - 1
+            else:
+                self.mix_step -= 1
+            return next(self)
         #Get the index of the clip tokens.
         clip_idx = (torch.sum(toks.attention_mask, dim=-1).to("cpu") - torch.tensor([1] * len(txts)))
         #Get latent vectors
@@ -214,6 +211,20 @@ report_loss_every = 10
 #save every 500 batches
 save_every = 500
 
+#generate every
+generate_every = 100
+generate_template = tokenizer("EleutherAI is", return_tensors="pt").to(model_engine.local_rank)
+text_so_far = list()
+#Generate text samples occasionally
+def generate_from_template():
+    if model_engine.local_rank == 0:
+        model_out = model.generate(input_ids=generate_template['input_ids'],\
+                max_length=128, bad_words_ids=[[data.special_token_idx],[data.special_token_idx+1]]).squeeze()
+        text = tokenizer.decode(model_out)
+        print(text)
+        #text_so_far.append(["EleutherAI is ", text])
+        #wandb.log({"Generated": text})
+
 for batch, data_elem in pbar:
     torch.cuda.empty_cache()
     model_input = {
@@ -225,12 +236,6 @@ for batch, data_elem in pbar:
     # compute model once for both CLIP and AR
     model_out = model_engine(**model_input, return_dict=True, output_hidden_states=True)
     out_embeds = model_out['hidden_states']
-    #print("Layers:\n\n")
-    #print(out_embeds[-1])
-    #print("Logits:\n\n")
-    #print(model_out['logits'])
-    # debug shapes
-    #print([(k, v.shape if isinstance(v, torch.Tensor) else v) for k, v in data_elem.items()])
 
     #If we are currently using contrastive loss
     if data_elem['use_distill']:
@@ -250,7 +255,7 @@ for batch, data_elem in pbar:
         #compute AR loss if Pile data
         n_text_toks = data_elem['clip_idx'].sum()
         loss = ar_loss(model_out, data_elem['input_ids']) / n_text_toks
-    #loss = model_engine(batch)
+    #Accumulate loss, check if NaN. If not, update progress
     if not torch.any(loss.isnan()):
         model_engine.backward(loss.to(torch.float32))
         model_engine.step()
@@ -263,9 +268,10 @@ for batch, data_elem in pbar:
         else:
             ar_loss_progress += loss.to(torch.float32).detach().cpu().item()
             ar_step_count += 1
-
+    if batch%generate_every==0:
+        generate_from_template()
     
-    #Update loss progress
+    #Update loss progress. For WandB
     if (batch+1)%report_loss_every==0:
         loss_progress /= float(loss_step_count)
         if model_engine.local_rank == 0:
@@ -283,7 +289,10 @@ for batch, data_elem in pbar:
     #Save model
     if (batch+1)%save_every==0:
         torch.distributed.barrier()
-        ckpt_id = loss.item()
+        ckpt_id = (batch+1)
+        #model_engine.save_checkpoint(f"models/{wandb.run.name}{ckpt_id}")
+        #model_engine.module.save_pretrained(wandb.run.dir)
+        # local or global?
         if model_engine.local_rank == 0:
             model_engine.module.save_pretrained(f"models/{wandb.run.name}/{ckpt_id}", ckpt_id)
         #model.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
