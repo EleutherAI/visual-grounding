@@ -32,7 +32,14 @@
      "hysteresis": 2,
      "min_loss_scale": 0
    },
-  
+  "scheduler":{
+     "type":"WarmupLR",
+     "params":{
+        "warmup_min_lr":0,
+	"warmup_max_lr":5e-5,
+	"warmup_num_steps":200
+     }
+  },
   "wall_clock_breakdown": false,
   "zero_allow_untested_optimizer": false
 }
