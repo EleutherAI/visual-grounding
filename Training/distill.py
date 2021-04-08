@@ -1,5 +1,5 @@
 from transformers import GPTNeoModel, GPTNeoForCausalLM,\
-    GPT2Tokenizer, GPTNeoConfig, AdamW
+    GPT2TokenizerFast, GPTNeoConfig, AdamW
 from torch.utils.data import IterableDataset, DataLoader 
 from lm_dataformat import *
 import torch
@@ -10,7 +10,8 @@ from auto_tqdm import tqdm
 from get_args import get_args
 import deepspeed
 import wandb
-
+import os
+from random import randint
 
 # set random
 import torch
@@ -33,20 +34,23 @@ conf.gradient_checkpointing = True
 model = GPTNeoForCausalLM.from_pretrained("EleutherAI/gpt-neo-1.3B", config=conf)
 model.training = True
 
-tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-1.3B")
+tokenizer = GPT2TokenizerFast.from_pretrained("EleutherAI/gpt-neo-1.3B")
 neo_hidden = model.config.hidden_size
 #resize token embeddings. Two extra tokens
 model.resize_token_embeddings(len(tokenizer)+2)
 #Initialize a random projection matrix
 clip_hidden = 512
-projection = torch.nn.Linear(neo_hidden, clip_hidden, bias=False).to(model_engine.local_rank)
+projection = torch.nn.Linear(neo_hidden, clip_hidden, bias=False)
 #Set up deep speed
+#print(list(projection.parameters()))
 model_engine, optimizer, _, _ = deepspeed.initialize(args=args,
                                                         model=model,
                                                         model_parameters=\
-                                                            list(model.parameters())+list(projection.parameters()))
+                                                            (model.parameters())
+#                                                            +list(projection.parameters())
+                                                            )
 model_engine.to(model_engine.local_rank)
-projection.to(model_engine.local_rank)
+projection = projection.to(model_engine.local_rank)
 #Set up wandb
 if model_engine.local_rank == 0:
     wandb.init(project='speedrun', entity='eleutherai')
@@ -58,8 +62,8 @@ temperature = 1.0
 learning_rate = 5e-5
 weight_decay = 0
 grad_accum = 2
-clip_bs = 48
-lambda_coeff = 0.75 #relative scale for contrastive loss
+clip_bs = 32
+lambda_coeff = 0.1 #relative scale for contrastive loss
 mixing_ratio = 3 #Ratio of pile examples to CLIP examples 
 
 temp_tensor = torch.tensor(temperature).to(model_engine.local_rank)
@@ -74,8 +78,11 @@ if model_engine.local_rank == 0:
     config.lambda_c=lambda_coeff
 
     wandb.watch(model)
-    
-    torch.save(projection, f"models/{wandb.run.name}/projection.pt")
+    try:
+        os.makedirs(f"models/{wandb.run.name}")    
+        torch.save(projection, f"models/{wandb.run.name}/projection.pt")
+    except:
+        pass
 
 
 #pytorch dataset for clip juicing
@@ -120,35 +127,34 @@ class DistillDataset(IterableDataset):
         if self.mix_step % mixing_ratio==0:
             use_clip=True
             self.mix_step=0
-        try:
-            #Return an element from the pile
-            if not use_clip:
-                text, _ =next(self.pile_rdr)
-                txts.append(text)
-                #Tokenize text
-                toks = tok.batch_encode_plus(txts, max_length=512, truncation=True,\
-                    padding="max_length", return_tensors="pt").to(model_engine.local_rank)
-                img_latents.append([[0]*clip_hidden])
-            #Return an element from CLIP
-            else:
-                txts = list()
-                for _ in range(self.clip_batch_size):
-                    text, img_latent=next(self.clip_rdr)
-                    #Append special token
-                    text += "<|CLIP|>"
-                    txts.append(text)
-                    img_latents.append([img_latent])
+        #Return an element from the pile
+        if not use_clip:
+            text, _ =next(self.pile_rdr)
 
-                #Tokenize text
-                toks = tok.batch_encode_plus(txts, max_length=128, truncation=True,\
-                    padding="max_length", return_tensors="pt").to(model_engine.local_rank)
-        except:
-            #If the current file has issues, load the next one
-            if self.mix_step == 0:
-                self.mix_step = mixing_ratio - 1
-            else:
-                self.mix_step -= 1
-            return next(self)
+            #text split. Check if we are over length. Truncate accordingly
+            ts = text.split()
+            if len(ts) > 512:
+                start = randint(0, len(ts)-512)
+                text = " ".join(ts[start:])
+            txts.append(text)
+
+            #Tokenize text
+            toks = tok.batch_encode_plus(txts, max_length=512, truncation=True,\
+                padding="max_length", return_tensors="pt").to(model_engine.local_rank)
+            img_latents.append([[0]*clip_hidden])
+        #Return an element from CLIP
+        else:
+            txts = list()
+            for _ in range(self.clip_batch_size):
+                text, img_latent=next(self.clip_rdr)
+                #Append special token
+                text += "<|CLIP|>"
+                txts.append(text)
+                img_latents.append([img_latent])
+
+            #Tokenize text
+            toks = tok.batch_encode_plus(txts, max_length=128, truncation=True,\
+                padding="max_length", return_tensors="pt").to(model_engine.local_rank)
         #Get the index of the clip tokens.
         clip_idx = (torch.sum(toks.attention_mask, dim=-1).to("cpu") - torch.tensor([1] * len(txts)))
         #Get latent vectors
@@ -197,7 +203,7 @@ def ar_loss(out_embeds, inp):
 #Load dataset
 data = DistillDataset(tokenizer = tokenizer, clip_batch_size = clip_bs,\
     clip_dataset_dir = "../../clip/",\
-    pile_dataset_dir = "../../val.jsonl.zst")
+    pile_dataset_dir = "../../pile/")
 loader = DataLoader(dataset=data, batch_size=1)
 
 #Check to see if a checkpoint exists. if it does, load that. Otherwise assume we are on step zero.
