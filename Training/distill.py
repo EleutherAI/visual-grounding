@@ -72,6 +72,7 @@ learning_rate = 5e-5
 weight_decay = 0
 grad_accum = 2
 clip_bs = 32
+pile_bs = 2
 lambda_coeff = 0.1 #relative scale for contrastive loss
 mixing_ratio = 3 #Ratio of pile examples to CLIP examples 
 
@@ -138,14 +139,15 @@ class DistillDataset(IterableDataset):
             self.mix_step=0
         #Return an element from the pile
         if not use_clip:
-            text, _ =next(self.pile_rdr)
-
-            #text split. Check if we are over length. Truncate accordingly
-            ts = text.split()
-            if len(ts) > 512:
-                start = randint(0, len(ts)-512)
-                text = " ".join(ts[start:])
-            txts.append(text)
+            for _ in range(pile_bs):
+                text, _ =next(self.pile_rdr)
+        
+                #text split. Check if we are over length. Truncate accordingly
+                ts = text.split()
+                if len(ts) > 512:
+                    start = randint(0, len(ts)-512)
+                    text = " ".join(ts[start:])
+                txts.append(text)
 
             #Tokenize text
             toks = tok.batch_encode_plus(txts, max_length=512, truncation=True,\
@@ -198,7 +200,7 @@ def ar_loss(out_embeds, inp):
     logprobs = F.log_softmax(
         torch.cat([
             raw_logits[:, :, :50257],
-            -1e10 * torch.ones(raw_logits.shape[0], raw_logits.shape[1], 2)
+            -1e10 * torch.ones(raw_logits.shape[0], raw_logits.shape[1], 2).to(model_engine.local_rank)
         ], dim=-1)
         , dim=-1).to(torch.float32)
     # logprobs :: [b, seq, vocab]
