@@ -15,11 +15,11 @@ from random import randint
 
 # set random
 import torch
-torch.manual_seed(42)
+torch.manual_seed(52)
 import random
-random.seed(42)
+random.seed(52)
 import numpy as np
-np.random.seed(42)
+np.random.seed(52)
 
 
 #enable tf32
@@ -40,10 +40,22 @@ neo_hidden = model.config.hidden_size
 model.resize_token_embeddings(len(tokenizer)+2)
 #Initialize a random projection matrix
 clip_hidden = 512
-projection = torch.nn.Linear(neo_hidden, clip_hidden, bias=False)
-projection.half()
 #Set up deep speed
-#print(list(projection.parameters()))
+
+#Set up our model wrapper, makes saving easier
+class projection_model(torch.nn.Module):
+    def __init__(self):
+        super(projection_model, self).__init__()
+        self.fc1 = torch.nn.Linear(neo_hidden, neo_hidden//2)
+        self.act = torch.nn.GELU()
+        self.fc2 = torch.nn.Linear(neo_hidden//2, clip_hidden)
+    def forward(self, input_tensor):
+        out = self.act(self.fc1(input_tensor))
+        return self.fc2(out)
+
+projection=projection_model()
+projection.half()
+
 class ModelWrapper(torch.nn.Module):
     def __init__(self, lm, proj):
         super(ModelWrapper, self).__init__()
@@ -72,7 +84,7 @@ learning_rate = 5e-5
 weight_decay = 0
 grad_accum = 2
 clip_bs = 32
-pile_bs = 2
+pile_bs = 1
 lambda_coeff = 0.1 #relative scale for contrastive loss
 mixing_ratio = 3 #Ratio of pile examples to CLIP examples 
 
@@ -90,7 +102,7 @@ if model_engine.local_rank == 0:
     wandb.watch(model)
     try:
         os.makedirs(f"models/{wandb.run.name}")    
-        torch.save(projection, f"models/{wandb.run.name}/projection.pt")
+        torch.save(wrapper.proj, f"models/{wandb.run.name}/projection.pt")
     except:
         pass
 
@@ -247,16 +259,18 @@ report_loss_every = 10
 save_every = 500
 
 #generate every
-generate_every = 100
+generate_every = 300
 generate_template = tokenizer("EleutherAI is", return_tensors="pt").to(model_engine.local_rank)
+clip_template = tokenizer("Monkey holding banana<|CLIP|>", return_tensors="pt").to(model_engine.local_rank)
+clip_idx_template = torch.sum(clip_template['attention_mask'], dim=-1).to("cpu").squeeze().item() - 1
 text_so_far = list()
 #Generate text samples occasionally
 def generate_from_template():
     if model_engine.local_rank == 0:
-        model_out = wrapper.lm.generate(input_ids=generate_template['input_ids'],\
-                max_length=128, bad_words_ids=[[data.special_token_idx],[data.special_token_idx+1]], no_repeat_ngram=5).squeeze()
-        text = tokenizer.decode(model_out)
-        print(text)
+        out_embeds = model_engine(**clip_template, return_dict=True, output_hidden_states=True)['hidden_states'][-2].squeeze()
+        CLIP_state = wrapper.proj(out_embeds[clip_idx_template]).cpu().detach().numpy()
+        np.savetxt('clip.out', CLIP_state, delimiter=",")
+
         #text_so_far.append(["EleutherAI is ", text])
         #wandb.log({"Generated": text})
 
@@ -313,7 +327,7 @@ for batch, data_elem in pbar:
             clip_loss_progress /= float(clip_step_count)
             clip_step_count = 0
 
-            ar_loss_progress /= float(ar_step_count)
+            ar_loss_progress /= float(max(ar_step_count,1))
             ar_step_count = 0
             wandb.log({'CLIP loss': clip_loss_progress, 'AR loss': ar_loss_progress, 'Loss' : loss_progress})
         pbar.set_description("Current loss: " + str(loss_progress))
@@ -330,6 +344,7 @@ for batch, data_elem in pbar:
         # local or global?
         if model_engine.local_rank == 0:
             model_engine.module.lm.save_pretrained(f"models/{wandb.run.name}/{ckpt_id}", ckpt_id)
+            torch.save(wrapper.proj, f"models/{wandb.run.name}/projection.pt")
         #model.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
         #tokenizer.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
 
