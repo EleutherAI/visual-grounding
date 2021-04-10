@@ -29,12 +29,12 @@ torch.backends.cudnn.allow_tf32 = True
 args = get_args()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 #create model, set neo_hidden
-conf = GPTNeoConfig.from_pretrained("EleutherAI/gpt-neo-1.3B")
+conf = GPTNeoConfig.from_pretrained("EleutherAI/gpt-neo-2.7B")
 conf.gradient_checkpointing = True
-model = GPTNeoForCausalLM.from_pretrained("EleutherAI/gpt-neo-1.3B", config=conf)
+model = GPTNeoForCausalLM.from_pretrained("EleutherAI/gpt-neo-2.7B", config=conf)
 model.training = True
 
-tokenizer = GPT2TokenizerFast.from_pretrained("EleutherAI/gpt-neo-1.3B")
+tokenizer = GPT2TokenizerFast.from_pretrained("EleutherAI/gpt-neo-2.7B")
 neo_hidden = model.config.hidden_size
 #resize token embeddings. Two extra tokens
 model.resize_token_embeddings(len(tokenizer)+2)
@@ -83,9 +83,9 @@ temperature = 1.0
 learning_rate = 5e-5
 weight_decay = 0
 grad_accum = 2
-clip_bs = 32
+clip_bs = 20
 pile_bs = 1
-lambda_coeff = 0.1 #relative scale for contrastive loss
+lambda_coeff = 0.0 #relative scale for contrastive loss
 mixing_ratio = 3 #Ratio of pile examples to CLIP examples 
 
 temp_tensor = torch.tensor(temperature).to(model_engine.local_rank)
@@ -156,13 +156,13 @@ class DistillDataset(IterableDataset):
         
                 #text split. Check if we are over length. Truncate accordingly
                 ts = text.split()
-                if len(ts) > 512:
-                    start = randint(0, len(ts)-512)
+                if len(ts) > 1024:
+                    start = randint(0, len(ts)-1024)
                     text = " ".join(ts[start:])
                 txts.append(text)
 
             #Tokenize text
-            toks = tok.batch_encode_plus(txts, max_length=512, truncation=True,\
+            toks = tok.batch_encode_plus(txts, max_length=1024, truncation=True,\
                 padding="max_length", return_tensors="pt").to(model_engine.local_rank)
             img_latents.append([[0]*clip_hidden])
         #Return an element from CLIP
@@ -261,13 +261,13 @@ save_every = 500
 #generate every
 generate_every = 300
 generate_template = tokenizer("EleutherAI is", return_tensors="pt").to(model_engine.local_rank)
-clip_template = tokenizer("Monkey holding banana<|CLIP|>", return_tensors="pt").to(model_engine.local_rank)
+clip_template = tokenizer("A drawing of a goose holding a knife<|CLIP|>", return_tensors="pt").to(model_engine.local_rank)
 clip_idx_template = torch.sum(clip_template['attention_mask'], dim=-1).to("cpu").squeeze().item() - 1
 text_so_far = list()
 #Generate text samples occasionally
 def generate_from_template():
     if model_engine.local_rank == 0:
-        out_embeds = model_engine(**clip_template, return_dict=True, output_hidden_states=True)['hidden_states'][-2].squeeze()
+        out_embeds = model_engine(**clip_template, return_dict=True, output_hidden_states=True)['hidden_states'][-4].squeeze()
         CLIP_state = wrapper.proj(out_embeds[clip_idx_template]).cpu().detach().numpy()
         np.savetxt('clip.out', CLIP_state, delimiter=",")
 
@@ -290,7 +290,7 @@ for batch, data_elem in pbar:
     if data_elem['use_distill']:
         #out_embeds ~ (b x seq_len x hidden_size)
         idx = data_elem['clip_idx']
-        last_layer = out_embeds[-2].squeeze() # -1 for second to last layer
+        last_layer = out_embeds[-4].squeeze() # -1 for second to last layer
         #Get predicted clip embedding. Grab from sequence_len dimension
         clip_embeds = torch.zeros((data.clip_batch_size, neo_hidden)).to(model_engine.local_rank)
         for i,j in enumerate(idx.tolist()[0]):
@@ -324,7 +324,7 @@ for batch, data_elem in pbar:
     if (batch+1)%report_loss_every==0:
         loss_progress /= float(loss_step_count)
         if model_engine.local_rank == 0:
-            clip_loss_progress /= float(clip_step_count)
+            clip_loss_progress /= float(max(clip_step_count,1))
             clip_step_count = 0
 
             ar_loss_progress /= float(max(ar_step_count,1))
