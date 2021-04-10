@@ -12,6 +12,8 @@ import deepspeed
 import wandb
 import os
 from random import randint
+import math
+
 
 # set random
 import torch
@@ -75,6 +77,10 @@ clip_bs = 32
 pile_bs = 2
 lambda_coeff = 0.1 #relative scale for contrastive loss
 mixing_ratio = 3 #Ratio of pile examples to CLIP examples 
+
+# lambda scheduling
+lschedule = "truncated_sine" # truncated_sine, shifted_sine, constant
+lperiod = 1000
 
 temp_tensor = torch.tensor(temperature).to(model_engine.local_rank)
 
@@ -285,7 +291,15 @@ for batch, data_elem in pbar:
         #Project to the correct size
         clip_embeds = wrapper.proj(clip_embeds.to(torch.float16))
         #Compute contrastive loss
-        loss = lambda_coeff * clip_loss(clip_embeds,  data_elem['latent_vecs'], temp_tensor)
+        if lschedule == "constant":
+            actual_lambda = lambda_coeff
+        elif lschedule == "truncated_sine":
+            actual_lambda = lambda_coeff * max(0, math.sin(2*math.pi / lperiod * batch))
+        elif lschedule == "shifted_sine":
+            actual_lambda = lambda_coeff * math.sin(math.pi / lperiod * batch)**2
+        else:
+            raise NotImplementedError()    
+        loss = actual_lambda * clip_loss(clip_embeds,  data_elem['latent_vecs'], temp_tensor)
     else:
         #compute AR loss if Pile data
         n_text_toks = data_elem['clip_idx'].sum()
