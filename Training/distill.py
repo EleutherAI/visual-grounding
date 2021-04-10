@@ -17,11 +17,11 @@ import math
 
 # set random
 import torch
-torch.manual_seed(42)
+torch.manual_seed(52)
 import random
-random.seed(42)
+random.seed(52)
 import numpy as np
-np.random.seed(42)
+np.random.seed(52)
 
 
 #enable tf32
@@ -31,21 +31,33 @@ torch.backends.cudnn.allow_tf32 = True
 args = get_args()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 #create model, set neo_hidden
-conf = GPTNeoConfig.from_pretrained("EleutherAI/gpt-neo-1.3B")
+conf = GPTNeoConfig.from_pretrained("EleutherAI/gpt-neo-2.7B")
 conf.gradient_checkpointing = True
-model = GPTNeoForCausalLM.from_pretrained("EleutherAI/gpt-neo-1.3B", config=conf)
+model = GPTNeoForCausalLM.from_pretrained("EleutherAI/gpt-neo-2.7B", config=conf)
 model.training = True
 
-tokenizer = GPT2TokenizerFast.from_pretrained("EleutherAI/gpt-neo-1.3B")
+tokenizer = GPT2TokenizerFast.from_pretrained("EleutherAI/gpt-neo-2.7B")
 neo_hidden = model.config.hidden_size
 #resize token embeddings. Two extra tokens
 model.resize_token_embeddings(len(tokenizer)+2)
 #Initialize a random projection matrix
 clip_hidden = 512
-projection = torch.nn.Linear(neo_hidden, clip_hidden, bias=False)
-projection.half()
 #Set up deep speed
-#print(list(projection.parameters()))
+
+#Set up our model wrapper, makes saving easier
+class projection_model(torch.nn.Module):
+    def __init__(self):
+        super(projection_model, self).__init__()
+        self.fc1 = torch.nn.Linear(neo_hidden, neo_hidden//2)
+        self.act = torch.nn.GELU()
+        self.fc2 = torch.nn.Linear(neo_hidden//2, clip_hidden)
+    def forward(self, input_tensor):
+        out = self.act(self.fc1(input_tensor))
+        return self.fc2(out)
+
+projection=projection_model()
+projection.half()
+
 class ModelWrapper(torch.nn.Module):
     def __init__(self, lm, proj):
         super(ModelWrapper, self).__init__()
@@ -73,9 +85,10 @@ temperature = 1.0
 learning_rate = 5e-5
 weight_decay = 0
 grad_accum = 2
-clip_bs = 32
-pile_bs = 2
+clip_bs = 20
+pile_bs = 1
 lambda_coeff = 0.1 #relative scale for contrastive loss
+
 mixing_ratio = 3 #Ratio of pile examples to CLIP examples 
 
 # lambda scheduling
@@ -96,7 +109,7 @@ if model_engine.local_rank == 0:
     wandb.watch(model)
     try:
         os.makedirs(f"models/{wandb.run.name}")    
-        torch.save(projection, f"models/{wandb.run.name}/projection.pt")
+        torch.save(wrapper.proj, f"models/{wandb.run.name}/projection.pt")
     except:
         pass
 
@@ -150,13 +163,14 @@ class DistillDataset(IterableDataset):
         
                 #text split. Check if we are over length. Truncate accordingly
                 ts = text.split()
-                if len(ts) > 512:
-                    start = randint(0, len(ts)-512)
+                if len(ts) > 1024:
+                    start = randint(0, len(ts)-1024)
+
                     text = " ".join(ts[start:])
                 txts.append(text)
 
             #Tokenize text
-            toks = tok.batch_encode_plus(txts, max_length=512, truncation=True,\
+            toks = tok.batch_encode_plus(txts, max_length=1024, truncation=True,\
                 padding="max_length", return_tensors="pt").to(model_engine.local_rank)
             img_latents.append([[0]*clip_hidden])
         #Return an element from CLIP
@@ -253,16 +267,18 @@ report_loss_every = 10
 save_every = 500
 
 #generate every
-generate_every = 100
+generate_every = 300
 generate_template = tokenizer("EleutherAI is", return_tensors="pt").to(model_engine.local_rank)
+clip_template = tokenizer("A drawing of a goose holding a knife<|CLIP|>", return_tensors="pt").to(model_engine.local_rank)
+clip_idx_template = torch.sum(clip_template['attention_mask'], dim=-1).to("cpu").squeeze().item() - 1
 text_so_far = list()
 #Generate text samples occasionally
 def generate_from_template():
     if model_engine.local_rank == 0:
-        model_out = wrapper.lm.generate(input_ids=generate_template['input_ids'],\
-                max_length=128, bad_words_ids=[[data.special_token_idx],[data.special_token_idx+1]], no_repeat_ngram=5).squeeze()
-        text = tokenizer.decode(model_out)
-        print(text)
+        out_embeds = model_engine(**clip_template, return_dict=True, output_hidden_states=True)['hidden_states'][-4].squeeze()
+        CLIP_state = wrapper.proj(out_embeds[clip_idx_template]).cpu().detach().numpy()
+        np.savetxt('clip.out', CLIP_state, delimiter=",")
+
         #text_so_far.append(["EleutherAI is ", text])
         #wandb.log({"Generated": text})
 
@@ -282,7 +298,7 @@ for batch, data_elem in pbar:
     if data_elem['use_distill']:
         #out_embeds ~ (b x seq_len x hidden_size)
         idx = data_elem['clip_idx']
-        last_layer = out_embeds[-2].squeeze() # -1 for second to last layer
+        last_layer = out_embeds[-4].squeeze() # -1 for second to last layer
         #Get predicted clip embedding. Grab from sequence_len dimension
         clip_embeds = torch.zeros((data.clip_batch_size, neo_hidden)).to(model_engine.local_rank)
         for i,j in enumerate(idx.tolist()[0]):
@@ -324,10 +340,10 @@ for batch, data_elem in pbar:
     if (batch+1)%report_loss_every==0:
         loss_progress /= float(loss_step_count)
         if model_engine.local_rank == 0:
-            clip_loss_progress /= float(clip_step_count)
+            clip_loss_progress /= float(max(clip_step_count,1))
             clip_step_count = 0
 
-            ar_loss_progress /= float(ar_step_count)
+            ar_loss_progress /= float(max(ar_step_count,1))
             ar_step_count = 0
             wandb.log({'CLIP loss': clip_loss_progress, 'AR loss': ar_loss_progress, 'Loss' : loss_progress})
         pbar.set_description("Current loss: " + str(loss_progress))
@@ -344,6 +360,7 @@ for batch, data_elem in pbar:
         # local or global?
         if model_engine.local_rank == 0:
             model_engine.module.lm.save_pretrained(f"models/{wandb.run.name}/{ckpt_id}", ckpt_id)
+            torch.save(wrapper.proj, f"models/{wandb.run.name}/projection.pt")
         #model.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
         #tokenizer.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
 
