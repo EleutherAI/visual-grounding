@@ -49,7 +49,7 @@ clip_hidden = 512
 
 
 
-projection=projection_model()
+projection=projection_model(neo_hidden)
 projection.half()
 
 
@@ -87,7 +87,6 @@ if model_engine.local_rank == 0:
 data = DistillDataset(tokenizer = tokenizer, clip_batch_size = clip_bs,\
     clip_dataset_dir = "../../clip/",\
     pile_dataset_dir = "../../pile/", local_rank = model_engine.local_rank)
-loader = DataLoader(dataset=data, batch_size=1)
 
 #Check to see if a checkpoint exists. if it does, load that. Otherwise assume we are on step zero.
 try:
@@ -98,7 +97,7 @@ except:
     step = 0
 
 #Set up progress bar
-pbar = tqdm(enumerate(loader), total=len(data))
+pbar = tqdm(enumerate(data), total=len(data))
 loss_progress = 0.0
 loss_step_count = 0
 
@@ -112,6 +111,8 @@ clip_step_count = 0
 report_loss_every = 10
 #save every 500 batches
 save_every = 500
+#What are the number of optimizer steps we've done
+true_step = 0
 
 #generate every
 generate_every = 300
@@ -128,7 +129,7 @@ def generate_from_template():
         np.savetxt('clip.out', CLIP_state, delimiter=",")
 
 
-for batch, data_elem in pbar:
+for _, data_elem in pbar:
     torch.cuda.empty_cache()
     model_input = {
         'input_ids':data_elem['input_ids'],
@@ -144,32 +145,47 @@ for batch, data_elem in pbar:
     if data_elem['use_distill']:
         #out_embeds ~ (b x seq_len x hidden_size)
         idx = data_elem['clip_idx']
+        start = data_elem['start']
+        end = data_elem['end']
         last_layer = out_embeds[-4].squeeze() # -1 for second to last layer
         #Get predicted clip embedding. Grab from sequence_len dimension
         clip_embeds = torch.zeros((data.clip_batch_size, neo_hidden)).to(model_engine.local_rank)
-        for i,j in enumerate(idx.tolist()[0]):
+        for i,j in enumerate(idx.tolist()):
             clip_embeds[i] = last_layer[i][j]
 
         #Project to the correct size
         clip_embeds = wrapper.proj(clip_embeds.to(torch.float16))
+        #Frozen gradients for accum
+        latent_copy = data_elem['latent_vecs']
+        latent_copy[data_elem['start']:data_elem['end']] = clip_embeds
+
+        latent_copy = latent_copy.to(torch.float32)
+        latent_vecs = data_elem['latent_vecs'].to(torch.float32)
+
         #Compute contrastive loss
         if lschedule == "constant":
             actual_lambda = lambda_coeff
         elif lschedule == "truncated_sine":
-            actual_lambda = lambda_coeff * max(0, math.sin(2*math.pi / lperiod * batch))
+            actual_lambda = lambda_coeff * max(0, math.sin(2*math.pi / lperiod * true_step))
         elif lschedule == "shifted_sine":
-            actual_lambda = lambda_coeff * math.sin(math.pi / lperiod * batch)**2
+            actual_lambda = lambda_coeff * math.sin(math.pi / lperiod * true_step)**2
         else:
             raise NotImplementedError()    
-        loss = actual_lambda * clip_loss(clip_embeds,  data_elem['latent_vecs'], temp_tensor)
+        loss = actual_lambda * clip_loss(latent_copy,  latent_vecs,\
+        temp_tensor, local_rank=model_engine.local_rank)
+
     else:
         #compute AR loss if Pile data
         n_text_toks = data_elem['clip_idx'].sum()
-        loss = ar_loss(model_out, data_elem['input_ids']) / n_text_toks
+        loss = ar_loss(model_out, data_elem['input_ids'], local_rank=model_engine.local_rank) / n_text_toks
+
+    if model_engine.is_gradient_accumulation_boundary():
+        true_step += 1
     #Accumulate loss, check if NaN. If not, update progress
     if not torch.any(loss.isnan()):
         model_engine.backward(loss.to(torch.float32))
-        model_engine.step()
+        if data_elem['is_accum']:
+            model_engine.step()
         loss_progress += loss.to(torch.float32).detach().cpu().item()
         loss_step_count += 1
 
@@ -179,11 +195,11 @@ for batch, data_elem in pbar:
         else:
             ar_loss_progress += loss.to(torch.float32).detach().cpu().item()
             ar_step_count += 1
-    if batch%generate_every==0:
+    if true_step%generate_every==0:
         generate_from_template()
     
     #Update loss progress. For WandB
-    if (batch+1)%report_loss_every==0:
+    if (true_step+1)%report_loss_every==0:
         loss_progress /= float(loss_step_count)
         if model_engine.local_rank == 0:
             clip_loss_progress /= float(max(clip_step_count,1))
@@ -198,9 +214,9 @@ for batch, data_elem in pbar:
         ar_loss_progress = 0.0
         loss_step_count = 0 
     #Save model
-    if (batch+1)%save_every==0:
+    if (true_step+1)%save_every==0:
         torch.distributed.barrier()
-        ckpt_id = (batch+1)
+        ckpt_id = (true_step+1)
 
         # local or global?
         if model_engine.local_rank == 0:

@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from torch.nn.functional import normalize, cross_entropy
 
 #Contrastive loss helper function
-def clip_loss(a, b, temp):
+def clip_loss(a, b, temp, local_rank):
     # a ~ (b x d)
     # b ~ (b x d)
     batch_size, dimension = a.shape
@@ -12,25 +12,25 @@ def clip_loss(a, b, temp):
     b_normd = normalize(b, p=2, dim=1).squeeze().to(torch.float32)
     logits = torch.einsum('i d, j d -> i j', a_normd, b_normd) * temp.exp()
 
-    labels = torch.arange(batch_size).to(model_engine.local_rank)
+    labels = torch.arange(batch_size).to(local_rank)
 
     loss = cross_entropy(logits, labels) + cross_entropy(logits.T, labels)
     
     return loss / 2.0
 
-def ar_loss(out_embeds, inp):
+def ar_loss(out_embeds, inp, local_rank):
     # inp :: [b, seq]
-    raw_logits = out_embeds['logits'].squeeze(0)
+    raw_logits = out_embeds['logits']
     logprobs = F.log_softmax(
         torch.cat([
             raw_logits[:, :, :50257],
-            -1e10 * torch.ones(raw_logits.shape[0], raw_logits.shape[1], 2).to(model_engine.local_rank)
+            -1e10 * torch.ones(raw_logits.shape[0], raw_logits.shape[1], 2).to(local_rank)
         ], dim=-1)
         , dim=-1).to(torch.float32)
     # logprobs :: [b, seq, vocab]
 
     pred = logprobs[:, :-1]
-    tgt = inp.squeeze(0)[:, 1:]
+    tgt = inp[:, 1:]
 
     is_clip_or_padding_token = tgt >= 50257
     

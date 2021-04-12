@@ -5,6 +5,7 @@ import os
 from random import randint
 import math
 from lm_dataformat import *
+from torch.utils.data import IterableDataset, DataLoader 
 
 #hparams
 temperature = 1.0
@@ -14,6 +15,7 @@ grad_accum = 2
 clip_bs = 20
 pile_bs = 1
 lambda_coeff = 0.1 #relative scale for contrastive loss
+gamma_coeff = 1000. #Scale for AR loss, equiv to macro
 
 mixing_ratio = 3 #Ratio of pile examples to CLIP examples 
 
@@ -26,7 +28,7 @@ lperiod = 1000
 
 #Set up our model wrapper, makes saving easier
 class projection_model(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, neo_hidden, clip_hidden=512):
         super(projection_model, self).__init__()
         self.fc1 = torch.nn.Linear(neo_hidden, neo_hidden//2)
         self.act = torch.nn.GELU()
@@ -47,10 +49,10 @@ class ModelWrapper(torch.nn.Module):
 
 class ContrastiveLossHandler(IterableDataset):
     def __init__(self, reader, tokenizer,
-    text_len=128, special_token="<|CLIP|>", micro=20, macro=1.6e4):
+    text_len=128, special_token="<|CLIP|>", micro=20, macro=int(gamma_coeff)):
         super(ContrastiveLossHandler, self).__init__()
         self.micro=micro
-        self.macro=macro
+        self.macro=int(macro)
         self.text_len=text_len
         self.special_token=special_token
         self.text_list=list()
@@ -65,16 +67,23 @@ class ContrastiveLossHandler(IterableDataset):
     def __next__(self):
         if self.is_accum:
             out_text = self.text_list[self.step*self.micro:min((self.step+1)*self.micro, self.macro)]
+            toks = self.tokenizer.batch_encode_plus(out_text, max_length=self.text_len, truncation=True,\
+                padding="max_length", return_tensors="pt")
+
+            start=self.step*self.micro
+            end=min((self.step+1)*self.micro, self.macro)
+        
             out_latents = self.latents
             #If we have reached the end
-            if min((self.step+1)*self.micro, self.macro) == self.macro:
+            if end == self.macro:
                 self.is_accum = False
             else:
                 self.step += 1
-            return {
-                **out_text,
+            return toks, {
                 'latent_vecs':out_latents,
                 'is_accum':self.is_accum,
+                'start_idx':start,
+                'end_idx':end,
             }
         else:
             #If we have nothing accumulated, accum now
@@ -102,17 +111,15 @@ class ContrastiveLossHandler(IterableDataset):
             txts.append(txt)
             latents.append([img_latent])
         #Tokenize text
-        toks = tok.batch_encode_plus(txts, max_length=self.text_len, truncation=True,\
-            padding="max_length", return_tensors="pt")
-        self.text_list=toks
+        self.text_list=txts
         self.latents=torch.cat([torch.tensor(x) for x in latents], dim=0)
 
 #pytorch dataset for clip juicing
 class DistillDataset(IterableDataset):
     def __init__(self,\
         tokenizer, clip_batch_size,
-        clip_dataset_dir, pile_dataset_dir,
-        special_token = "<|CLIP|>", steps = 1e6, local_rank):
+        clip_dataset_dir, pile_dataset_dir, local_rank,
+        special_token = "<|CLIP|>", steps = 1e6):
         self.clip_dataset_dir = clip_dataset_dir
         self.pile_dataset_dir = pile_dataset_dir
 
@@ -125,7 +132,7 @@ class DistillDataset(IterableDataset):
         self.clip_batch_size = clip_batch_size
 
         #Start on an example of WIT.
-        self.mix_step = 0 
+        self.mix_step = 1
 
         #Store special token, add to tokenizer. Remember to resize token embeddings on model!
         self.tokenizer = tokenizer
@@ -139,8 +146,7 @@ class DistillDataset(IterableDataset):
         #Store previous image latents. Used to accumulate larger batch sizes
         self.last_latents=None
         #Are we currently in a contrastive batch where we need to accumulate loss?
-        self.currently_contrastive=False
-        self.closs_handler=ContrastiveLossHandler(reader=clip_rdr,tokenizer=self.tokenizer)
+        self.closs_handler=ContrastiveLossHandler(reader=self.clip_rdr,tokenizer=self.tokenizer)
         
     def __len__(self):
         return int(self.steps)
@@ -150,8 +156,13 @@ class DistillDataset(IterableDataset):
         tok = self.tokenizer
         txts = list()
         img_latents = list()
-
+        #Are we using CLIP this step
         use_clip = False
+        #Are we accumulating this step (e.g. do we NOT call optmizer.step())
+        is_accum = False
+        #What index we start and end at
+        start=0
+        end=0
 
         if self.mix_step % mixing_ratio==0:
             use_clip=True
@@ -172,7 +183,7 @@ class DistillDataset(IterableDataset):
             #Tokenize text
             toks = tok.batch_encode_plus(txts, max_length=1024, truncation=True,\
                 padding="max_length", return_tensors="pt").to(self.local_rank)
-            img_latents.append([[0]*clip_hidden])
+            img_latents.append([[0]*512])
 
             #Mixing
             self.mix_step += 1
@@ -181,26 +192,29 @@ class DistillDataset(IterableDataset):
         
         #Return an element from CLIP
         else:
-            data=next(self.closs_handler)
+            toks, data=next(self.closs_handler)
+            is_accum = data['is_accum']
             #If we finished closs
             if not data['is_accum']:
                 self.mix_step+=1
-            toks={
-                'input_ids':data['input_ids'],
-                'attention_mask':data['attention_mask'],
-            }
             toks.to(self.local_rank)
-            latents=data['latent_vecs']
+            latents=data['latent_vecs'].to(self.local_rank)
             latents.to(self.local_rank)
+            start=data['start_idx']
+            end=data['end_idx']
 
         #Get the index of the clip tokens.
-        clip_idx = (torch.sum(toks.attention_mask, dim=-1).to("cpu") - torch.tensor([1] * len(txts)))
+        clip_idx = (torch.sum(toks.attention_mask, dim=-1).to("cpu") -\
+        torch.tensor([1] * len(toks.attention_mask)))
 
         return {
             **toks,
             'latent_vecs' : latents,
             'clip_idx' : clip_idx, 
             'use_distill' : use_clip,
+            'is_accum' : is_accum,
+            'start' : start,
+            'end' : end,
         }
 
 
