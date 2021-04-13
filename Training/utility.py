@@ -15,9 +15,9 @@ grad_accum = 2
 clip_bs = 20
 pile_bs = 1
 lambda_coeff = 0.1 #relative scale for contrastive loss
-gamma_coeff = 1000. #Scale for AR loss, equiv to macro
+gamma_coeff = 500. #Scale for AR loss, equiv to macro
 
-mixing_ratio = 3 #Ratio of pile examples to CLIP examples 
+mixing_ratio = 10 #Ratio of pile examples to CLIP examples 
 
 # lambda scheduling
 lschedule = "truncated_sine" # truncated_sine, shifted_sine, constant

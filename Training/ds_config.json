@@ -1,6 +1,6 @@
 {
   "train_micro_batch_size_per_gpu":1,
-  "gradient_accumulation_steps": 32,
+  "gradient_accumulation_steps": 16,
   "steps_per_print": 2000,
   "zero_optimization": {
     "stage": 2,
