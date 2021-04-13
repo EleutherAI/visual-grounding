@@ -5,7 +5,7 @@ import os
 from random import randint
 import math
 from lm_dataformat import *
-from torch.utils.data import IterableDataset, DataLoader 
+from torch.utils.data import IterableDataset, Dataset, DataLoader 
 
 #hparams
 temperature = 1.0
@@ -14,14 +14,14 @@ weight_decay = 0
 grad_accum = 2
 clip_bs = 20
 pile_bs = 1
-lambda_coeff = 0.1 #relative scale for contrastive loss
-gamma_coeff = 500. #Scale for AR loss, equiv to macro
+lambda_coeff = 0.75 #relative scale for contrastive loss
+gamma_coeff = 200. #Scale for AR loss, equiv to macro
 
 mixing_ratio = 10 #Ratio of pile examples to CLIP examples 
 
 # lambda scheduling
-lschedule = "truncated_sine" # truncated_sine, shifted_sine, constant
-lperiod = 1000
+lschedule = "shifted_sine" # truncated_sine, shifted_sine, constant
+lperiod = 500
 
 
 
@@ -43,6 +43,7 @@ class ModelWrapper(torch.nn.Module):
         super(ModelWrapper, self).__init__()
         self.lm = lm
         self.proj = proj
+        self.temperature = torch.nn.Parameter(torch.ones(1))
     def forward(self, **kwargs):
         return self.lm(**kwargs)
 
@@ -115,10 +116,10 @@ class ContrastiveLossHandler(IterableDataset):
         self.latents=torch.cat([torch.tensor(x) for x in latents], dim=0)
 
 #pytorch dataset for clip juicing
-class DistillDataset(IterableDataset):
+class DistillDataset(Dataset):
     def __init__(self,\
         tokenizer, clip_batch_size,
-        clip_dataset_dir, pile_dataset_dir, local_rank,
+        clip_dataset_dir, pile_dataset_dir, world_size=6, local_rank ="cuda",
         special_token = "<|CLIP|>", steps = 1e6):
         self.clip_dataset_dir = clip_dataset_dir
         self.pile_dataset_dir = pile_dataset_dir
@@ -132,7 +133,7 @@ class DistillDataset(IterableDataset):
         self.clip_batch_size = clip_batch_size
 
         #Start on an example of WIT.
-        self.mix_step = 1
+        self.mix_step = 0
 
         #Store special token, add to tokenizer. Remember to resize token embeddings on model!
         self.tokenizer = tokenizer
@@ -142,16 +143,44 @@ class DistillDataset(IterableDataset):
         self.tokenizer.add_tokens([special_token])
         self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         self.local_rank=local_rank
+        self.world_size=world_size
 
         #Store previous image latents. Used to accumulate larger batch sizes
         self.last_latents=None
         #Are we currently in a contrastive batch where we need to accumulate loss?
         self.closs_handler=ContrastiveLossHandler(reader=self.clip_rdr,tokenizer=self.tokenizer)
-        
+        self.last_index=0
+    def set_local_rank(self, local_rank):
+        self.local_rank=local_rank
     def __len__(self):
         return int(self.steps)
     def __iter__(self):
         return self
+    def __getitem__(self,idx):
+        print("Dataset idx: " + str(idx))
+        print("Last idx: " + str(self.last_index))
+        while self.last_index < idx:
+            next(self)
+            self.last_index+=1
+        data=next(self)
+        #If on the next time this GPU runs we would be over the macro limit
+        next_step = (data['end'] + self.world_size * self.closs_handler.micro)
+        #Check if we are over the limit and if we were going to accum this step
+        if next_step >= self.closs_handler.macro and data['is_accum']:
+            self.mix_step+=1
+            data['is_accum'] = False
+            print("Next step is mixing")
+        #Cast to GPU
+        return {
+            'input_ids':data['input_ids'].to(self.local_rank),
+            'attention_mask':data['attention_mask'].to(self.local_rank),
+            'latent_vecs':data['latent_vecs'].to(self.local_rank),
+            'clip_idx':data['clip_idx'].squeeze(),
+            'use_distill':data['use_distill'],
+            'is_accum':data['is_accum'],
+            'start':data['start'],
+            'end':data['end'],
+        }
     def __next__(self):
         tok = self.tokenizer
         txts = list()
@@ -182,13 +211,13 @@ class DistillDataset(IterableDataset):
 
             #Tokenize text
             toks = tok.batch_encode_plus(txts, max_length=1024, truncation=True,\
-                padding="max_length", return_tensors="pt").to(self.local_rank)
+                padding="max_length", return_tensors="pt")
             img_latents.append([[0]*512])
 
             #Mixing
             self.mix_step += 1
             #Get latent vectors
-            latents = torch.cat([torch.tensor(x) for x in img_latents], dim=0).to(self.local_rank)
+            latents = torch.cat([torch.tensor(x) for x in img_latents], dim=0)
         
         #Return an element from CLIP
         else:
@@ -197,14 +226,12 @@ class DistillDataset(IterableDataset):
             #If we finished closs
             if not data['is_accum']:
                 self.mix_step+=1
-            toks.to(self.local_rank)
-            latents=data['latent_vecs'].to(self.local_rank)
-            latents.to(self.local_rank)
+            latents=data['latent_vecs']
             start=data['start_idx']
             end=data['end_idx']
 
         #Get the index of the clip tokens.
-        clip_idx = (torch.sum(toks.attention_mask, dim=-1).to("cpu") -\
+        clip_idx = (torch.sum(toks.attention_mask, dim=-1) -\
         torch.tensor([1] * len(toks.attention_mask)))
 
         return {

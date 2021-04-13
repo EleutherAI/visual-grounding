@@ -20,7 +20,7 @@ def clip_loss(a, b, temp, local_rank):
 
 def ar_loss(out_embeds, inp, local_rank):
     # inp :: [b, seq]
-    raw_logits = out_embeds['logits']
+    raw_logits = out_embeds['logits'].unsqueeze(0)
     logprobs = F.log_softmax(
         torch.cat([
             raw_logits[:, :, :50257],
@@ -30,7 +30,7 @@ def ar_loss(out_embeds, inp, local_rank):
     # logprobs :: [b, seq, vocab]
 
     pred = logprobs[:, :-1]
-    tgt = inp[:, 1:]
+    tgt = inp.unsqueeze(0)[:, 1:]
 
     is_clip_or_padding_token = tgt >= 50257
     
