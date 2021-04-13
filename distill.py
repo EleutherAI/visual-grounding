@@ -107,15 +107,14 @@ ar_step_count = 0
 clip_loss_progress = 0.0
 clip_step_count = 0
 
-#reset counters every
-reset_every = 25
 #save every 20 steps
-save_every = 500
+save_every = 20
 #What are the number of optimizer steps we've done
 true_step = 0
+report = False
 
 #generate every
-generate_every = 1000
+generate_every = 100
 generate_template = tokenizer("EleutherAI is", return_tensors="pt").to(model_engine.local_rank)
 clip_template = tokenizer("A drawing of a goose holding a knife<|CLIP|>", return_tensors="pt").to(model_engine.local_rank)
 clip_idx_template = torch.sum(clip_template['attention_mask'], dim=-1).to("cpu").squeeze().item() - 1
@@ -129,7 +128,7 @@ def generate_from_template():
         np.savetxt('clip.out', CLIP_state, delimiter=",")
 
 
-for batch, data_elem in pbar:
+for _, data_elem in pbar:
     torch.cuda.empty_cache()
     model_input = {
         'input_ids':data_elem['input_ids'],
@@ -158,15 +157,17 @@ for batch, data_elem in pbar:
         #Frozen gradients for accum
         latent_copy = data_elem['latent_vecs']
         latent_copy[data_elem['start']:data_elem['end']] = clip_embeds
-        latent_vecs = data_elem['latent_vecs'].to(torch.float16)
+
+        latent_copy = latent_copy.to(torch.float32)
+        latent_vecs = data_elem['latent_vecs'].to(torch.float32)
 
         #Compute contrastive loss
         if lschedule == "constant":
             actual_lambda = lambda_coeff
         elif lschedule == "truncated_sine":
-            actual_lambda = lambda_coeff * max(0, math.sin(2*math.pi / lperiod * batch))
+            actual_lambda = lambda_coeff * max(0, math.sin(2*math.pi / lperiod * true_step))
         elif lschedule == "shifted_sine":
-            actual_lambda = lambda_coeff * math.sin(math.pi / lperiod * batch)**2
+            actual_lambda = lambda_coeff * math.sin(math.pi / lperiod * true_step)**2
         else:
             raise NotImplementedError()    
         loss = actual_lambda * clip_loss(latent_copy,  latent_vecs,\
@@ -177,6 +178,9 @@ for batch, data_elem in pbar:
         n_text_toks = data_elem['clip_idx'].sum()
         loss = ar_loss(model_out, data_elem['input_ids'], local_rank=model_engine.local_rank) / n_text_toks
 
+    if model_engine.is_gradient_accumulation_boundary():
+        true_step += 1
+        report=True
     #Accumulate loss, check if NaN. If not, update progress
     if not torch.any(loss.isnan()):
         model_engine.backward(loss.to(torch.float32))
@@ -191,28 +195,32 @@ for batch, data_elem in pbar:
         else:
             ar_loss_progress += loss.to(torch.float32).detach().cpu().item()
             ar_step_count += 1
-    if (batch+1)%generate_every==0:
+    if true_step%generate_every==0:
         generate_from_template()
     
-    #For reporting
-    if (batch+1)%reset_every==0:
+    #Update loss progress. For WandB
+    if report:
+        loss_progress /= float(loss_step_count)
         if model_engine.local_rank == 0:
-            loss_t = loss_progress / float(loss_step_count)
-            clip_t = clip_loss_progress / float(max(clip_step_count,1))
-            ar_t = ar_loss_progress / float(max(ar_step_count,1))
+            clip_loss_progress /= float(max(clip_step_count,1))
+            clip_step_count = 0
 
-            wandb.log({'CLIP loss': clip_t, 'AR loss': ar_t, 'Loss' : loss_t})
-            pbar.set_description("Current loss: " + str(loss_progress))
+            ar_loss_progress /= float(max(ar_step_count,1))
+            ar_step_count = 0
+            wandb.log({'CLIP loss': clip_loss_progress, 'AR loss': ar_loss_progress, 'Loss' : loss_progress})
+        pbar.set_description("Current loss: " + str(loss_progress))
         loss_progress = 0.0
         clip_loss_progress = 0.0
         ar_loss_progress = 0.0
         loss_step_count = 0
-        clip_step_count = 0
-        ar_step_count = 0
+        report=False
     #Save model
-    if (batch+1)%save_every==0:
+    if (true_step+1)%save_every==0:
+        torch.distributed.barrier()
+        ckpt_id = (true_step+1)
+
+        # local or global?
         if model_engine.local_rank == 0:
-            ckpt_id = (batch+1)
             model_engine.module.lm.save_pretrained(f"models/{wandb.run.name}/{ckpt_id}", ckpt_id)
             torch.save(wrapper.proj, f"models/{wandb.run.name}/projection.pt")
 
