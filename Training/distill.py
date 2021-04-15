@@ -168,20 +168,30 @@ for batch, data_elem in pbar:
         elif lschedule == "shifted_sine":
             actual_lambda = lambda_coeff * math.sin(math.pi / lperiod * batch)**2
         else:
-            raise NotImplementedError()    
-        loss = actual_lambda * clip_loss(latent_copy,  latent_vecs,\
-        temp_tensor, local_rank=model_engine.local_rank)
+            raise NotImplementedError()            
+        loss = clip_loss(latent_copy,  latent_vecs,\
+        wrapper.temperature, local_rank=model_engine.local_rank)
+        if model_engine.local_rank == 0:
+            wandb.log({"CLIP batch loss": loss})
+        loss = actual_lambda * loss
 
+
+    #compute AR loss if Pile data
+    n_text_toks = data_elem['clip_idx'].sum()
+    ar_l =ar_loss(model_out, data_elem['input_ids'], local_rank=model_engine.local_rank) / n_text_toks
+    if loss is None:
+        loss = ar_l
     else:
-        #compute AR loss if Pile data
-        n_text_toks = data_elem['clip_idx'].sum()
-        loss = ar_loss(model_out, data_elem['input_ids'], local_rank=model_engine.local_rank) / n_text_toks
+        loss += ar_l
 
     #Accumulate loss, check if NaN. If not, update progress
     if not torch.any(loss.isnan()):
         model_engine.backward(loss.to(torch.float32))
-        if data_elem['is_accum']:
-            model_engine.step()
+        model_engine.step()
+        #Clamp the temperature
+        with torch.no_grad():
+            wrapper.temperature.clamp_(1./100., 100.)
+
         loss_progress += loss.to(torch.float32).detach().cpu().item()
         loss_step_count += 1
 

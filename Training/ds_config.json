@@ -1,6 +1,6 @@
 {
   "train_micro_batch_size_per_gpu":1,
-  "gradient_accumulation_steps": 16,
+  "gradient_accumulation_steps": 32,
   "steps_per_print": 2000,
   "zero_optimization": {
     "stage": 2,
@@ -36,7 +36,7 @@
      "type":"WarmupLR",
      "params":{
         "warmup_min_lr":0,
-	"warmup_max_lr":5e-5,
+	"warmup_max_lr":2e-4,
 	"warmup_num_steps":200
      }
   },
