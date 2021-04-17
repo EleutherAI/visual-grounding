@@ -207,7 +207,7 @@ for batch, data_elem in pbar:
     #For reporting
     if (batch+1)%reset_every==0:
         if model_engine.local_rank == 0:
-            loss_t = loss_progress / float(loss_step_count)
+            loss_t = loss_progress / float(max(loss_step_count,1))
             clip_t = clip_loss_progress / float(max(clip_step_count,1))
             ar_t = ar_loss_progress / float(max(ar_step_count,1))
 
@@ -224,7 +224,7 @@ for batch, data_elem in pbar:
         if model_engine.local_rank == 0:
             ckpt_id = (batch+1)
             model_engine.module.lm.save_pretrained(f"models/{wandb.run.name}/{ckpt_id}", ckpt_id)
-            torch.save(wrapper.proj, f"models/{wandb.run.name}/projection.pt")
+            #torch.save(wrapper.proj, f"models/{wandb.run.name}/projection.pt")
 
 model_engine.save_checkpoint(args.save_dir, ckpt_id, client_sd=client_sd)
 tokenizer.save_pretrained("GPT-Neo-Enriched")

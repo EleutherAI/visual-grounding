@@ -12,12 +12,12 @@ temperature = 1.0
 learning_rate = 5e-5
 weight_decay = 0
 grad_accum = 2
-clip_bs = 20
+clip_bs = 10
 pile_bs = 1
 lambda_coeff = 1.0 #relative scale for contrastive loss
 gamma_coeff = 500. #Scale for AR loss, equiv to macro
 
-mixing_ratio = 10 #Ratio of pile examples to CLIP examples 
+mixing_ratio = 20 #Ratio of pile examples to CLIP examples 
 
 # lambda scheduling
 lschedule = "constant" # truncated_sine, shifted_sine, constant
@@ -50,7 +50,7 @@ class ModelWrapper(torch.nn.Module):
 
 class ContrastiveLossHandler(IterableDataset):
     def __init__(self, reader, tokenizer,
-    text_len=128, special_token="<|CLIP|>", micro=20, macro=int(gamma_coeff)):
+    text_len=128, special_token="<|CLIP|>", micro=10, macro=int(gamma_coeff)):
         super(ContrastiveLossHandler, self).__init__()
         self.micro=micro
         self.macro=int(macro)
