@@ -14,9 +14,10 @@
 
 import torch
 import collections
+import transformers
 
-from .utils import logging
-from .file_utils import ExplicitEnum
+from transformers.utils import logging
+from transformers.file_utils import ExplicitEnum
 
 logger = logging.get_logger(__name__)
 
