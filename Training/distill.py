@@ -16,6 +16,7 @@ import math
 #Helper files
 from utility import *
 from loss import *
+from debug_utils import DebugActivationOverflow, DebugOption
 
 
 # set random
@@ -183,6 +184,8 @@ for batch, data_elem in pbar:
         loss = ar_l
     else:
         loss += ar_l
+    if DebugOption.ACIVATION_OVERFLOW in args.debug:
+        debug_overflow = DebugActivationOverflow(model_engine) # original uses self.model so it might need some looking into
 
     #Accumulate loss, check if NaN. If not, update progress
     if not torch.any(loss.isnan()):
