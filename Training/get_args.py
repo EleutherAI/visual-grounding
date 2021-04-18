@@ -17,7 +17,7 @@ def get_args():
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file')
     group.add_argument('--debug', type=str, default='activation_overflow'
-                      help='debug tool from transformers used to detect overflow')
+                      help='debug tool from transformers used to detect overflow'),
     group.add_argument('--merge-file', type=str, default=None,
                        help='Path to the BPE merge file (if necessary).')
     group.add_argument('--append-eod', action='store_true',
