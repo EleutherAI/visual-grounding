@@ -12,15 +12,15 @@ temperature = 1.0
 learning_rate = 5e-5
 weight_decay = 0
 grad_accum = 2
-clip_bs = 20
+clip_bs = 10
 pile_bs = 1
-lambda_coeff = 0.1 #relative scale for contrastive loss
+lambda_coeff = 1.0 #relative scale for contrastive loss
 gamma_coeff = 500. #Scale for AR loss, equiv to macro
 
-mixing_ratio = 10 #Ratio of pile examples to CLIP examples 
+mixing_ratio = 20 #Ratio of pile examples to CLIP examples 
 
 # lambda scheduling
-lschedule = "truncated_sine" # truncated_sine, shifted_sine, constant
+lschedule = "constant" # truncated_sine, shifted_sine, constant
 lperiod = 1000
 
 
@@ -43,13 +43,14 @@ class ModelWrapper(torch.nn.Module):
         super(ModelWrapper, self).__init__()
         self.lm = lm
         self.proj = proj
+        self.temperature = torch.nn.Parameter(torch.ones(1))
     def forward(self, **kwargs):
         return self.lm(**kwargs)
 
 
 class ContrastiveLossHandler(IterableDataset):
     def __init__(self, reader, tokenizer,
-    text_len=128, special_token="<|CLIP|>", micro=20, macro=int(gamma_coeff)):
+    text_len=128, special_token="<|CLIP|>", micro=10, macro=int(gamma_coeff)):
         super(ContrastiveLossHandler, self).__init__()
         self.micro=micro
         self.macro=int(macro)
@@ -77,6 +78,7 @@ class ContrastiveLossHandler(IterableDataset):
             #If we have reached the end
             if end == self.macro:
                 self.is_accum = False
+                self.step=0
             else:
                 self.step += 1
             return toks, {
