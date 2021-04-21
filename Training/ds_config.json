@@ -20,12 +20,11 @@
       "weight_decay": 0
     }
   },
-  
-  
+
+
   "gradient_clipping": 0.5,
-  "fp16": { 
-     "fp16": true,
-     "enabled": true,
+  "fp16": {
+     "enabled": false,
      "loss_scale": 0,
      "initial_scale_power":16,
      "loss_scale_window": 1000,
