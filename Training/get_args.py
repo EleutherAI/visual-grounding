@@ -16,6 +16,8 @@ def get_args():
     group = parser.add_argument_group(title='tokenizer')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file')
+    group.add_argument('--debug',  action='store_true',
+                      help='debug tool from transformers used to detect overflow'),
     group.add_argument('--merge-file', type=str, default=None,
                        help='Path to the BPE merge file (if necessary).')
     group.add_argument('--append-eod', action='store_true',
