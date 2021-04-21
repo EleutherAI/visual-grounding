@@ -134,3 +134,7 @@ dmypy.json
 
 #ignore transformers
 transformers/
+config.json
+*.pt 
+Training/wandb
+*.yaml
