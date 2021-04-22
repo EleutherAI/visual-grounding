@@ -1,6 +1,10 @@
 git+https://github.com/huggingface/transformers/
 lm_dataformat
 auto-tqdm
-git+https://github.com/openai/CLIP.git
+--no-dependencies git+https://github.com/openai/CLIP.git
+ftfy
+regex
+tqdm
+torchvision~=0.8.2
 Pillow
 iterlib
