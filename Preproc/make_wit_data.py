@@ -18,7 +18,7 @@ from io import BytesIO
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("dev:",device)
-model, preprocess = clip.load("ViT-B/32", device=device, jit=True)
+model, preprocess = clip.load("ViT-B/32", device=device, jit=False)
 model.eval()
 model = model.to(device)
 def clip_encode_img(img):
