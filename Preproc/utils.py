@@ -50,7 +50,7 @@ def curl(x):
         try:
             response = urllib.request.urlopen(x, timeout=30)
             data = response.read()
-        except urllib.URLError as e:
+        except urllib.error.URLError as e:
             if e.code == 429:
                 time.sleep(cooldown)
                 cooldown *= 1.5
