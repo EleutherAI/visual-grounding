@@ -23,7 +23,7 @@ model.eval()
 model = model.to(device)
 def clip_encode_img(img):
     with torch.no_grad():
-        img = img >> each(swallow_errors(lambda im: preprocess(im).unsqueeze(0))) >> filter(id)
+        img = img >> each(swallow_errors(lambda im: preprocess(im).unsqueeze(0))) >> filter(lambda x: x is not None)
         image = torch.cat(list(img), dim=0).to(device)
         image_features = model.encode_image(image)
         return image_features.cpu().tolist()
