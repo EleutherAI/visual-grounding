@@ -1,11 +1,9 @@
 git+https://github.com/huggingface/transformers/
 lm_dataformat
 auto-tqdm
-git+https://github.com/openai/CLIP.git
+git+https://github.com/leogao2/CLIP.git
 ftfy
 regex
 tqdm
-torch==1.8.1+cu111 -f https://download.pytorch.org/whl/torch_stable.html
-torchvision==0.9.1+cu111 -f https://download.pytorch.org/whl/torch_stable.html
 Pillow
 iterlib
