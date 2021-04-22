@@ -48,10 +48,10 @@ def curl(x):
     cooldown = 1
     for i in range(10):
         try:
-            response = urllib.request.urlopen(x, timeout=30, 
-                            headers={
+            req = urllib.request.Request(x, headers={
                                 'User-Agent': 'WebImageText-collector/0.0 (https://github.com/EleutherAI/visual-grounding/; contact@eleuther.ai) pyfra/0.0'
                             })
+            response = urllib.request.urlopen(req, timeout=30)
             data = response.read()
         except urllib.error.URLError as e:
             if e.code == 429:
