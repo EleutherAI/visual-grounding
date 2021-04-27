@@ -8,6 +8,9 @@ from torch.nn.functional import normalize, cross_entropy
 from torch.nn import DataParallel
 from auto_tqdm import tqdm
 
+from utility import *
+from loss import *
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 #initalize a smol boi
@@ -22,7 +25,7 @@ tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-1.3B")
 #Initialize a random projection matrix
 neo_hidden = model.config.hidden_size
 clip_hidden = 512
-projection = torch.nn.Linear(neo_hidden, clip_hidden, bias=False).to(device)
+projection = projection_model(neo_hidden)
 
 
 #hparams
@@ -34,6 +37,23 @@ clip_bs = 128
 lambda_coeff = 1.0 #relative scale for contrastive loss
 
 temp_tensor = torch.tensor(temperature).to(device)
+
+#Set up wandb
+if torch.cuda.device(args.local_rank) == 0:
+    wandb.init(project='speedrun', entity='eleutherai')
+    config=wandb.config
+    config.learning_rate=learning_rate
+    config.temp=temperature
+    config.weight_decay=weight_decay
+    config.clip_batch_suze=clip_bs
+    config.lambda_c=lambda_coeff
+
+    wandb.watch(model)
+    try:
+        os.makedirs(f"models/{wandb.run.name}")    
+        torch.save(wrapper.proj, f"models/{wandb.run.name}/projection.pt")
+    except:
+        pass
 
 #pytorch dataset for clip juicing
 class DistillDataset(IterableDataset):
