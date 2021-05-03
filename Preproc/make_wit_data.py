@@ -67,21 +67,6 @@ class debug(FlowOp):
             print("debug", it)
             yield it
 
-import multiprocessing as mp
-from iterlib import thread_preload
-
-
-class pmap(FlowOp):
-    def __init__(self, f):
-        self.pool = mp.Pool(64)
-        self.f = f
-        if isinstance(self.f, Reflective): self.f = f.run
-
-    def __rrshift__(self, other):
-        global _wrapper
-        def _wrapper(x):
-            return self.f(x)
-        return (self.pool.imap(_wrapper, other))
 
 
 def dl_imgs():
@@ -97,16 +82,15 @@ def dl(x):
     except:
         return None
 
-pool = mp.Pool(128)
 
 from tqdm import tqdm
 
-pairs = pool.imap(dl, dl_imgs()) >> filter(id)
+pairs = map(dl, dl_imgs()) >> filter(id)
 batch_size = 256
 
 pairs = pairs >> filter(X[0]) >> each(pointwise(BytesIO, id)) >> each(pointwise(swallow_errors(Image.open), id)) >> filter(X[0])
 
-imlats = pairs >> do(partial(thread_preload, buffer_size=100000)) >> chunks(batch_size) >> each(lambda x: zip(*x)) >> each(pointwise(clip_encode_img, id)) >> each(lambda x: zip(*x)) >> join()
+imlats = pairs >> chunks(batch_size) >> each(lambda x: zip(*x)) >> each(pointwise(clip_encode_img, id)) >> each(lambda x: zip(*x)) >> join()
 
 import lm_dataformat as lmd
 
