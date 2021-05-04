@@ -12,15 +12,17 @@
 
     "zero_optimization": {
         "stage": 3,
-        "cpu_offload": true,
-        "cpu_offload_params": true,
-        "cpu_offload_use_pin_memory" : true,
+        "offload_optimizer": {
+            "device": "cpu"
+        },
+        "offload_param": {
+            "device": "cpu"
+        },
         "overlap_comm": true,
         "contiguous_gradients": true,
-        "sub_group_size": 1e14,
         "reduce_bucket_size": 2e7,
-        "stage3_prefetch_bucket_size": 2e7,
-        "stage3_param_persistence_threshold": 2e7,
+        "stage3_prefetch_bucket_size": 2e6,
+        "stage3_param_persistence_threshold": 2e6,
         "stage3_max_live_parameters": 1e9,
         "stage3_max_reuse_distance": 1e9,
         "stage3_gather_fp16_weights_on_model_save": true
@@ -45,7 +47,14 @@
             "warmup_num_steps": 100
         }
     },
-
+    "activation_checkpointing": {
+        "partition_activations": true,
+        "cpu_checkpointing": true,
+        "contiguous_memory_optimization": true,
+        "number_checkpoints": 1,
+        "synchronize_checkpoint_boundary": false,
+        "profile": false
+    },
     "steps_per_print": 2000,
     "wall_clock_breakdown": false
 }

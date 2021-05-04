@@ -5,14 +5,15 @@ import os
 from random import randint
 import math
 from lm_dataformat import *
-from torch.utils.data import IterableDataset, DataLoader 
-
+from torch.utils.data import IterableDataset, Dataset, DataLoader 
+from transformers import GPTNeoModel, GPTNeoForCausalLM,\
+    GPT2TokenizerFast, GPTNeoConfig
 #hparams
 temperature = 1.0
 learning_rate = 5e-5
 weight_decay = 0
 grad_accum = 2
-clip_bs = 10
+clip_bs = 2
 pile_bs = 1
 lambda_coeff = 1.0 #relative scale for contrastive loss
 gamma_coeff = 200. #Scale for AR loss, equiv to macro
@@ -39,18 +40,33 @@ class projection_model(torch.nn.Module):
 
 
 class ModelWrapper(torch.nn.Module):
-    def __init__(self, lm, proj):
+    def __init__(self, model_name="EleutherAI/gpt-neo-2.7B"):
         super(ModelWrapper, self).__init__()
-        self.lm = lm
-        self.proj = proj
+        #Load config and model
+        conf = GPTNeoConfig.from_pretrained(model_name)
+        conf.gradient_checkpointing = True
+        model = GPTNeoForCausalLM.from_pretrained(model_name, config=conf)
+        model.training = True
+
+        tokenizer = GPT2TokenizerFast.from_pretrained(model_name)
+        neo_hidden = model.config.hidden_size
+        #resize token embeddings. Two extra tokens
+        model.resize_token_embeddings(len(tokenizer)+2)
+        #Initialize a random projection matrix
+        clip_hidden = 512
+        self.tokenizer=tokenizer
+        self.lm = model
+        self.proj = projection_model(neo_hidden)
         self.temperature = torch.nn.Parameter(torch.ones(1))
+    def get_tokenizer(self):
+        return self.tokenizer
     def forward(self, **kwargs):
         return self.lm(**kwargs)
 
 
 class ContrastiveLossHandler(IterableDataset):
     def __init__(self, reader, tokenizer,
-    text_len=128, special_token="<|CLIP|>", micro=10, macro=int(gamma_coeff)):
+    text_len=128, special_token="<|CLIP|>", micro=2, macro=int(gamma_coeff)):
         super(ContrastiveLossHandler, self).__init__()
         self.micro=micro
         self.macro=int(macro)
@@ -134,7 +150,7 @@ class DistillDataset(IterableDataset):
         self.clip_batch_size = clip_batch_size
 
         #Start on an example of WIT.
-        self.mix_step = 1
+        self.mix_step = 0
 
         #Store special token, add to tokenizer. Remember to resize token embeddings on model!
         self.tokenizer = tokenizer
@@ -176,21 +192,21 @@ class DistillDataset(IterableDataset):
         
                 #text split. Check if we are over length. Truncate accordingly
                 ts = text.split()
-                if len(ts) > 1024:
-                    start = randint(0, len(ts)-1024)
-                    end = min(start + 1024, len(ts) - start)
+                if len(ts) > 512:
+                    start = randint(0, len(ts)-512)
+                    end = min(start + 512, len(ts) - start)
                     text = " ".join(ts[start:])
                 txts.append(text)
 
             #Tokenize text
-            toks = tok.batch_encode_plus(txts, max_length=1024, truncation=True,\
-                padding="max_length", return_tensors="pt").to(self.local_rank)
+            toks = tok.batch_encode_plus(txts, max_length=512, truncation=True,\
+                padding="max_length", return_tensors="pt")
             img_latents.append([[0]*512])
 
             #Mixing
             self.mix_step += 1
             #Get latent vectors
-            latents = torch.cat([torch.tensor(x) for x in img_latents], dim=0).to(self.local_rank)
+            latents = torch.cat([torch.tensor(x) for x in img_latents], dim=0)
         
         #Return an element from CLIP
         else:
@@ -199,9 +215,7 @@ class DistillDataset(IterableDataset):
             #If we finished closs
             if not data['is_accum']:
                 self.mix_step+=1
-            toks.to(self.local_rank)
-            latents=data['latent_vecs'].to(self.local_rank)
-            latents.to(self.local_rank)
+            latents=data['latent_vecs']
             start=data['start_idx']
             end=data['end_idx']
 
@@ -220,8 +234,44 @@ class DistillDataset(IterableDataset):
         }
 
 
+#Fetches the first k elements, useful for distributed dataloader
+class DistillDataset_Prefetch(Dataset):
+    def __init__(self,\
+        tokenizer, clip_batch_size,
+        clip_dataset_dir, pile_dataset_dir, k = 1000, local_rank="cuda",
+        special_token = "<|CLIP|>", steps = 1e6):
 
 
+        self.core = DistillDataset(tokenizer, clip_batch_size, \
+        clip_dataset_dir, pile_dataset_dir, local_rank, special_token, steps)
+
+        self.prefetch = list()
+        for i, elem in enumerate(self.core):
+            self.prefetch.append(elem)
+            if i == k:
+                break
+        self.length = k
+        self.local_rank = local_rank
+    def set_local_rank(self, new_local):
+        self.local_rank = new_local
+    def __len__(self):
+        return self.length
+    def cast(self, t, device):
+        new_dict = {}
+        for k in t.keys():
+            #Cast the objects that are castable, leave the rest
+            try:
+                new_dict[k] = t[k].squeeze().to(device)
+                if k in ['start', 'end', 'is_accum', 'use_distill']:
+                    new_dict[k] = new_dict[k].detach().cpu().item()[0]
+            except:
+                new_dict[k] = t[k]
+        return new_dict
+    def __getitem__(self, idx):
+        t = self.prefetch[idx]
+        return t
+
+    
 
 
 
