@@ -70,7 +70,7 @@ class debug(FlowOp):
 
 
 def dl_imgs():
-    return wit() >> filter(lambda x: x["language"] == "en") >> each(lambda x: (x["image_url"], x["caption_reference_description"])) >> filter(X[1])
+    return wit() >> filter(lambda x: x["language"] == "en") >> each(lambda x: (x["image_url"], x)) >> filter(X[1])
 
 
 def dl(x):
