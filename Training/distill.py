@@ -43,6 +43,7 @@ rank=torch.distributed.get_rank()
 data = DistillDataset_Prefetch(tokenizer = tokenizer, clip_batch_size = clip_bs,\
     clip_dataset_dir = "../../clip/",\
     pile_dataset_dir = "../../pile/", local_rank=rank)
+torch.distributed.barrier()    
 model_engine, optimizer, trainloader, _ = deepspeed.initialize(args=args,
                                                         model=wrapper,
                                                         model_parameters=wrapper.parameters(),
@@ -117,12 +118,15 @@ for batch, data_elem in pbar:
     #print(data_elem)
     model_input = {
         'input_ids':data_elem['input_ids'].squeeze(),
+        'labels':data_elem['input_ids'].squeeze(),
         'attention_mask':data_elem['attention_mask'].squeeze(),
     }
 
     if len(model_input['input_ids'].shape) == 1:
         model_input['input_ids'].unsqueeze_(0)
+        model_input['labels'].unsqueeze_(0)
         model_input['attention_mask'].unsqueeze_(0)
+
     loss = None
     
     # compute model once for both CLIP and AR
@@ -158,19 +162,20 @@ for batch, data_elem in pbar:
         else:
             raise NotImplementedError()            
         loss = clip_loss(latent_copy,  latent_vecs,\
-        wrapper.temperature)
+        wrapper.temperature, local_rank=model_engine.local_rank)
         if model_engine.local_rank == 0:
             wandb.log({"CLIP batch loss": loss})
         loss = actual_lambda * loss
-
+    else:
+        loss = model_out['loss']
 
     #compute AR loss if Pile data
-    n_text_toks = data_elem['clip_idx'].sum()
-    ar_l =ar_loss(model_out, data_elem['input_ids']) / n_text_toks
-    if loss is None:
-        loss = ar_l
-    else:
-        loss += ar_l
+    #n_text_toks = data_elem['clip_idx'].sum()
+    #ar_l =ar_loss(model_out, data_elem['input_ids'], local_rank=model_engine.local_rank) / n_text_toks
+    #if loss is None:
+    #    loss = ar_l
+    #else:
+    #    loss += ar_l
 
     #Accumulate loss, check if NaN. If not, update progress
     if not torch.any(loss.isnan()):
