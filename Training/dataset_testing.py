@@ -17,16 +17,13 @@ tokenizer = GPT2TokenizerFast.from_pretrained("EleutherAI/gpt-neo-1.3B")
 #wrapper = ModelWrapper(model, projection)
 
 
-data = DistillDataset(tokenizer = tokenizer, clip_batch_size = clip_bs,\
+data = DistillDataset_Prefetch(tokenizer = tokenizer, clip_batch_size = clip_bs,\
     clip_dataset_dir = "../../clip/",\
-    pile_dataset_dir = "../../pile/", local_rank="cuda")
+    pile_dataset_dir = "../../pile/", local_rank="cuda", k = 1000)
 
-loader = DataLoader(dataset=data, batch_size=1)
-pbar = tqdm(enumerate(data), total=len(data))
-
-
-for batch, data_elem in pbar:
-    print(data_elem)
-    pass
-    if batch == 10:
-        break
+#loader = DataLoader(dataset=data, batch_size=1)
+#pbar = tqdm(enumerate(data), total=len(data))
+print(data[500])
+#l = list()
+#for i, data_elem in pbar:
+#    l.append(data_elem)

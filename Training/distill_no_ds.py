@@ -1,45 +1,70 @@
 from transformers import GPTNeoModel, GPTNeoForCausalLM,\
-    GPT2Tokenizer, GPTNeoConfig, AdamW
+    GPT2TokenizerFast, GPTNeoConfig, AdamW
 from torch.utils.data import IterableDataset, DataLoader 
 from lm_dataformat import *
 import torch
 import torch.nn.functional as F
 from torch.nn.functional import normalize, cross_entropy
-from torch.nn import DataParallel
 from auto_tqdm import tqdm
+from get_args import get_args
+import deepspeed
+import wandb
+import os
+from random import randint
+import math
 
+#Helper files
 from utility import *
 from loss import *
 
+
+# set random
+import torch
+torch.manual_seed(52)
+import random
+random.seed(52)
+import numpy as np
+np.random.seed(52)
+
+
+#enable tf32
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+args = get_args()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#create model, set neo_hidden
+conf = GPTNeoConfig.from_pretrained("EleutherAI/gpt-neo-2.7B")
+conf.gradient_checkpointing = True
+model = GPTNeoForCausalLM.from_pretrained("EleutherAI/gpt-neo-2.7B", config=conf)
+model.training = True
 
-#initalize a smol boi
-config = GPTNeoConfig(hidden_size = 128, num_layers = 24, attention_layers = 24)
-#create model
-model = GPTNeoForCausalLM.from_pretrained("EleutherAI/gpt-neo-1.3B")
-if torch.cuda.device_count() > 1:
-    model_dp = DataParallel(model)
-model_dp.to(device)
-tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-1.3B")
-
-#Initialize a random projection matrix
+tokenizer = GPT2TokenizerFast.from_pretrained("EleutherAI/gpt-neo-2.7B")
 neo_hidden = model.config.hidden_size
+#resize token embeddings. Two extra tokens
+model.resize_token_embeddings(len(tokenizer)+2)
+#Initialize a random projection matrix
 clip_hidden = 512
-projection = projection_model(neo_hidden)
+#Set up deep speed
 
 
-#hparams
-temperature = 1.0
-learning_rate = 5e-5
-weight_decay = 0
-grad_accum = 2
-clip_bs = 128
-lambda_coeff = 1.0 #relative scale for contrastive loss
 
+projection=projection_model(neo_hidden)
+#projection.half()
+local_rank=args.local_rank
+device = "cuda" + str(local_rank)
+
+wrapper = ModelWrapper(model, projection)
+optimizer = AdamW(wrapper.parameters(), lr=1e-4)
+
+wrapper.to(device)
 temp_tensor = torch.tensor(temperature).to(device)
+torch.distributed.init_process_group(backend="nccl")
+
+wrapper = torch.nn.parallel.DistributedDataParallel(wrapper, device_ids=[local_rank], output_device=local_rank)
 
 #Set up wandb
-if torch.cuda.device(args.local_rank) == 0:
+if local_rank == 0:
     wandb.init(project='speedrun', entity='eleutherai')
     config=wandb.config
     config.learning_rate=learning_rate
@@ -55,181 +80,154 @@ if torch.cuda.device(args.local_rank) == 0:
     except:
         pass
 
-#pytorch dataset for clip juicing
-class DistillDataset(IterableDataset):
-    def __init__(self,\
-        tokenizer, clip_batch_size,
-        clip_dataset_dir, pile_dataset_dir,
-        special_token = "<|CLIP|>", steps = 1e6):
-        self.clip_dataset_dir = clip_dataset_dir
-        self.pile_dataset_dir = pile_dataset_dir
-
-        self.clip_rdr = Reader(self.clip_dataset_dir).stream_data(get_meta=True)
-        self.pile_rdr = Reader(self.pile_dataset_dir).stream_data(get_meta=True)
-
-        #Steps is the total number of elements we should use. Half from CLIP, half from AR
-        self.steps = steps
-        #How many elements are in a single contrastive clip batch
-        self.clip_batch_size = clip_batch_size
-
-        #Start on an example of WIT.
-        self.cur_clip = True
-
-        #Store special token, add to tokenizer. Remember to resize token embeddings on model!
-        self.tokenizer = tokenizer
-        self.special_token=special_token
-        #Get the index for the special token so that we can adjust the decode mask accordingly.
-        self.special_token_idx=len(self.tokenizer)
-        self.tokenizer.add_tokens([special_token])
-        self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-    def __len__(self):
-        return int(self.steps)
-    def __iter__(self):
-        return self
-    def __next__(self):
-        tok = self.tokenizer
-        txts = list()
-        img_latents = list()
-    
-        #Return an element from the pile
-        if not self.cur_clip:
-            text, _ =next(self.pile_rdr)
-            txts.append(text)
-            #Place holder
-            img_latents.append([[0]*clip_hidden])
-        #Return an element from CLIP
-        else:
-            txts = list()
-            for _ in range(self.clip_batch_size):
-                text, img_latent=next(self.clip_rdr)
-                #Append special token
-                text += "<|CLIP|>"
-                txts.append(text)
-                img_latents.append([img_latent])
-
-        #Tokenize text
-        toks = tok.batch_encode_plus(txts, max_length=2048, truncation=True, padding=True, return_tensors="pt").to(device)
-        #Get the index of the clip tokens.
-        clip_idx = (torch.sum(toks.attention_mask, dim=-1).to("cpu") - torch.tensor([1] * len(txts)))
-        #Get latent vectors
-        latents = torch.cat([torch.tensor(x) for x in img_latents], dim=0).to(device)
-
-        cc = self.cur_clip
-        #Flip cur clip
-        self.cur_clip = not self.cur_clip 
-        return {
-            **toks,
-            'latent_vecs' : latents,
-            'clip_idx' : clip_idx, 
-            'use_distill' : cc,
-        }
-
-#Contrastive loss helper function
-def clip_loss(a, b, temp):
-    # a ~ (b x d)
-    # b ~ (b x d)
-    batch_size, dimension = a.shape
-
-    a_normd = normalize(a, p=2, dim=1).squeeze()
-    b_normd = normalize(b, p=2, dim=1).squeeze()
-    logits = torch.einsum('i d, j d -> i j', a_normd, b_normd) * temp.exp()
-
-    labels = torch.arange(batch_size).to(device)
-
-    loss = cross_entropy(logits, labels) + cross_entropy(logits.T, labels)
-    
-    return loss / 2.0
-
-def ar_loss(model, inp, attn_mask):
-    # inp :: [b, seq]
-    logprobs = F.log_softmax(model(inp, attention_mask=attn_mask, return_dict=True)['logits'].squeeze(0), dim=-1)
-    # logprobs :: [b, seq, vocab]
-
-    pred = logprobs[:, :-1]
-    tgt = inp.squeeze(0)[:, 1:]
-
-    is_clip_or_padding_token = tgt >= 50257
-    
-    logits = torch.gather(pred, 2, tgt.unsqueeze(-1)).squeeze(-1) # [batch, seq-1]
-
-    # remove loss of clip-token
-    logits *= 1 - is_clip_or_padding_token.to(torch.int)
-
-    return -logits.sum()
 
 #Load dataset
 data = DistillDataset(tokenizer = tokenizer, clip_batch_size = clip_bs,\
-    clip_dataset_dir = "../clip_latents_100k.jsonl.zst",\
-    pile_dataset_dir = "../val.jsonl.zst")
-loader = DataLoader(dataset=data, batch_size=1)
+    clip_dataset_dir = "../../clip/" + str(local_rank) + "/",\
+    pile_dataset_dir = "../../pile/" + str(local_rank) + "/", local_rank = local_rank)
+data_loader = torch.utils.data.BatchSampler(torch.utils.data.DataLoader(data, num_workers=0),\
+batch_size=torch.distributed.get_world_size())
 
-#resize token embeddings
-model.resize_token_embeddings(len(data.tokenizer))
 
-#Set up optimizer
-opt = AdamW(list(model_dp.parameters()) + list(projection.parameters()), lr=learning_rate, weight_decay=weight_decay)
-
+#Check to see if a checkpoint exists. if it does, load that. Otherwise assume we are on step zero.
+#try:
+#    _, client_sd = model_engine.load_checkpoint(args.load_dir, args.ckpt_id)
+#    step = client_sd['step']
+#    loader_to_step(loader, step+1)
+#except:
+#    step = 0
 
 #Set up progress bar
-pbar = tqdm(enumerate(loader), total=len(data))
+pbar = tqdm(enumerate(data_loader), total=len(data))
 loss_progress = 0.0
+loss_step_count = 0
 
-#Update the pbar description every 20 batches
-report_loss_every = 20
-#save every 10000 batches
-save_every = 10000
+ar_loss_progress = 0.0
+ar_step_count = 0
 
+clip_loss_progress = 0.0
+clip_step_count = 0
+
+#reset counters every
+reset_every = 25
+#save every 20 steps
+save_every = 500
+#What are the number of optimizer steps we've done
+true_step = 0
+
+#generate every
+generate_every = 1000
+generate_template = tokenizer("EleutherAI is", return_tensors="pt").to(device)
+clip_template = tokenizer("A drawing of a goose holding a knife<|CLIP|>", return_tensors="pt").to(device)
+clip_idx_template = torch.sum(clip_template['attention_mask'], dim=-1).to("cpu").squeeze().item() - 1
+text_so_far = list()
+
+#Generate samples occasionally
+def generate_from_template():
+    if local_rank == 0:
+        out_embeds = wrapper(**clip_template, return_dict=True, output_hidden_states=True)['hidden_states'][-4].squeeze()
+        CLIP_state = wrapper.proj(out_embeds[clip_idx_template]).cpu().detach().numpy()
+        np.savetxt('clip.out', CLIP_state, delimiter=",")
+
+step = 0
 for batch, data_elem in pbar:
+    torch.cuda.empty_cache()
     model_input = {
         'input_ids':data_elem['input_ids'],
         'attention_mask':data_elem['attention_mask'],
     }
     loss = None
-    #Used for CLIP. TODO: Fetch AR loss (Leo pls do this)
-    out_embeds = model_dp(**model_input, return_dict=True, output_hidden_states=True)['hidden_states']
     
-    # debug shapes
-    #print([(k, v.shape if isinstance(v, torch.Tensor) else v) for k, v in data_elem.items()])
+    # compute model once for both CLIP and AR
+    model_out = wrapper(**model_input, return_dict=True, output_hidden_states=True)
+    out_embeds = model_out['hidden_states']
 
     #If we are currently using contrastive loss
     if data_elem['use_distill']:
         #out_embeds ~ (b x seq_len x hidden_size)
         idx = data_elem['clip_idx']
-        last_layer = out_embeds[-1].squeeze() # -1 for last layer
+        start = data_elem['start']
+        end = data_elem['end']
+        last_layer = out_embeds[-4].squeeze() # -1 for second to last layer
         #Get predicted clip embedding. Grab from sequence_len dimension
         clip_embeds = torch.zeros((data.clip_batch_size, neo_hidden)).to(device)
-        for i,j in enumerate(idx.tolist()[0]):
+        for i,j in enumerate(idx.tolist()):
             clip_embeds[i] = last_layer[i][j]
 
         #Project to the correct size
-        clip_embeds = projection(clip_embeds)
+        clip_embeds = wrapper.proj(clip_embeds.to(torch.float16))
+        #Frozen gradients for accum
+        latent_copy = data_elem['latent_vecs']
+        latent_copy[data_elem['start']:data_elem['end']] = clip_embeds
+        latent_vecs = data_elem['latent_vecs'].to(torch.float16)
+
         #Compute contrastive loss
-        loss = lambda_coeff * clip_loss(clip_embeds,  data_elem['latent_vecs'], temp_tensor)
+        if lschedule == "constant":
+            actual_lambda = lambda_coeff
+        elif lschedule == "truncated_sine":
+            actual_lambda = lambda_coeff * max(0, math.sin(2*math.pi / lperiod * batch))
+        elif lschedule == "shifted_sine":
+            actual_lambda = lambda_coeff * math.sin(math.pi / lperiod * batch)**2
+        else:
+            raise NotImplementedError()            
+        loss = clip_loss(latent_copy,  latent_vecs,\
+        wrapper.temperature, local_rank=local_rank)
+        if local_rank == 0:
+            wandb.log({"CLIP batch loss": loss})
+        loss = actual_lambda * loss
 
-    #compute AR loss
+
+    #compute AR loss if Pile data
     n_text_toks = data_elem['clip_idx'].sum()
-    if loss is not None:
-        loss += ar_loss(model_dp, data_elem['input_ids'], data_elem['attention_mask']) / n_text_toks
+    ar_l =ar_loss(model_out, data_elem['input_ids'], local_rank=local_rank) / n_text_toks
+    if loss is None:
+        loss = ar_l
     else:
-        loss = ar_loss(model_dp, data_elem['input_ids'], data_elem['attention_mask']) / n_text_toks
+        loss += ar_l
 
-    loss.backward()
-    loss_progress += loss.detach().cpu().item()
+    #Accumulate loss, check if NaN. If not, update progress
+    if not torch.any(loss.isnan()):
+        backward(loss.to(torch.float32)).backwards()
+        if not data_elem['is_accum']:
+            step += 1
+            if (step + 1)%16 == 0:
+                optimizer.step()
+                step = 0
+        #Clamp the temperature
+        with torch.no_grad():
+            wrapper.temperature.clamp_(1./100., 100.)
+
+        loss_progress += loss.to(torch.float32).detach().cpu().item()
+        loss_step_count += 1
+
+        if data_elem['use_distill']:
+            clip_loss_progress += loss.to(torch.float32).detach().cpu().item()
+            clip_step_count += 1
+        else:
+            ar_loss_progress += loss.to(torch.float32).detach().cpu().item()
+            ar_step_count += 1
+    if (batch+1)%generate_every==0:
+        generate_from_template()
     
-    #Accumulate gradients
-    if (batch+1)%grad_accum==0:
-        opt.step()
-        opt.zero_grad()
+    #For reporting
+    if (batch+1)%reset_every==0:
+        if local_rank == 0:
+            loss_t = loss_progress / float(max(loss_step_count,1))
+            clip_t = clip_loss_progress / float(max(clip_step_count,1))
+            ar_t = ar_loss_progress / float(max(ar_step_count,1))
 
-    #Update loss progress
-    if (batch+1)%report_loss_every==0:
-        loss_progress /= float(report_loss_every)
-        pbar.set_description("Current loss: " + str(loss_progress))
+            wandb.log({'CLIP loss': clip_t, 'AR loss': ar_t, 'Loss' : loss_t})
+            pbar.set_description("Current loss: " + str(loss_progress))
         loss_progress = 0.0
+        clip_loss_progress = 0.0
+        ar_loss_progress = 0.0
+        loss_step_count = 0
+        clip_step_count = 0
+        ar_step_count = 0
     #Save model
     if (batch+1)%save_every==0:
-        model.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
-        tokenizer.save_pretrained("GPT-Neo-Enriched"+str(batch+1))
+        if local_rank == 0:
+            ckpt_id = (batch+1)
+            #model_engine.module.lm.save_pretrained(f"models/{wandb.run.name}/{ckpt_id}", ckpt_id)
+            torch.save(wrapper.state_dict(), f"models/{wandb.run.name}/model_"+str(ckpt_id)+".pt")
 
-model.save_pretrained("GPT-Neo-Enriched")
-tokenizer.save_pretrained("GPT-Neo-Enriched")

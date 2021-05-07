@@ -32,35 +32,22 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 args = get_args()
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#create model, set neo_hidden
-conf = GPTNeoConfig.from_pretrained("EleutherAI/gpt-neo-2.7B")
-conf.gradient_checkpointing = True
-model = GPTNeoForCausalLM.from_pretrained("EleutherAI/gpt-neo-2.7B", config=conf)
-model.training = True
+model_name="EleutherAI/gpt-neo-1.3B"
 
-tokenizer = GPT2TokenizerFast.from_pretrained("EleutherAI/gpt-neo-2.7B")
-neo_hidden = model.config.hidden_size
-#resize token embeddings. Two extra tokens
-model.resize_token_embeddings(len(tokenizer)+2)
-#Initialize a random projection matrix
-clip_hidden = 512
-#Set up deep speed
-
-
-
-projection=projection_model(neo_hidden)
-#projection.half()
-
-
-
-wrapper = ModelWrapper(model, projection)
-model_engine, optimizer, _, _ = deepspeed.initialize(args=args,
+#Initialize model and DS
+wrapper = ModelWrapper(model_name)
+tokenizer=wrapper.get_tokenizer()
+deepspeed.zero.Init(module=wrapper, dtype=torch.float)
+rank=torch.distributed.get_rank()
+#Load dataset. Prefetches first k elements, defaults to 1000
+data = DistillDataset_Prefetch(tokenizer = tokenizer, clip_batch_size = clip_bs,\
+    clip_dataset_dir = "../../clip/",\
+    pile_dataset_dir = "../../pile/", local_rank=rank)
+model_engine, optimizer, trainloader, _ = deepspeed.initialize(args=args,
                                                         model=wrapper,
-                                                        model_parameters=wrapper.parameters())
-model_engine.to(model_engine.local_rank)
-temp_tensor = torch.tensor(temperature).to(model_engine.local_rank)
-
+                                                        model_parameters=wrapper.parameters(),
+                                                        training_data=data)
+#data.set_local_rank(model_engine.local_rank)
 
 
 #Set up wandb
@@ -73,7 +60,7 @@ if model_engine.local_rank == 0:
     config.clip_batch_suze=clip_bs
     config.lambda_c=lambda_coeff
 
-    wandb.watch(model)
+    wandb.watch(wrapper)
     try:
         os.makedirs(f"models/{wandb.run.name}")    
         torch.save(wrapper.proj, f"models/{wandb.run.name}/projection.pt")
@@ -81,10 +68,7 @@ if model_engine.local_rank == 0:
         pass
 
 
-#Load dataset
-data = DistillDataset(tokenizer = tokenizer, clip_batch_size = clip_bs,\
-    clip_dataset_dir = "../../clip/" + str(model_engine.local_rank) + "/",\
-    pile_dataset_dir = "../../pile/" + str(model_engine.local_rank) + "/", local_rank = model_engine.local_rank)
+
 
 #Check to see if a checkpoint exists. if it does, load that. Otherwise assume we are on step zero.
 try:
@@ -95,7 +79,7 @@ except:
     step = 0
 
 #Set up progress bar
-pbar = tqdm(enumerate(data), total=len(data))
+pbar = tqdm(enumerate(trainloader), total=len(trainloader))
 loss_progress = 0.0
 loss_step_count = 0
 
@@ -129,10 +113,16 @@ def generate_from_template():
 
 for batch, data_elem in pbar:
     torch.cuda.empty_cache()
+    data_elem = data.cast(data_elem, model_engine.device)
+    #print(data_elem)
     model_input = {
-        'input_ids':data_elem['input_ids'],
-        'attention_mask':data_elem['attention_mask'],
+        'input_ids':data_elem['input_ids'].squeeze(),
+        'attention_mask':data_elem['attention_mask'].squeeze(),
     }
+
+    if len(model_input['input_ids'].shape) == 1:
+        model_input['input_ids'].unsqueeze_(0)
+        model_input['attention_mask'].unsqueeze_(0)
     loss = None
     
     # compute model once for both CLIP and AR
@@ -168,7 +158,7 @@ for batch, data_elem in pbar:
         else:
             raise NotImplementedError()            
         loss = clip_loss(latent_copy,  latent_vecs,\
-        wrapper.temperature, local_rank=model_engine.local_rank)
+        wrapper.temperature)
         if model_engine.local_rank == 0:
             wandb.log({"CLIP batch loss": loss})
         loss = actual_lambda * loss
@@ -176,7 +166,7 @@ for batch, data_elem in pbar:
 
     #compute AR loss if Pile data
     n_text_toks = data_elem['clip_idx'].sum()
-    ar_l =ar_loss(model_out, data_elem['input_ids'], local_rank=model_engine.local_rank) / n_text_toks
+    ar_l =ar_loss(model_out, data_elem['input_ids']) / n_text_toks
     if loss is None:
         loss = ar_l
     else:
